@@ -1,0 +1,19 @@
+{
+  "id": "order-approval",
+  "entry": "received",
+  "nodes": [
+    { "id": "received", "type": "trigger", "next": "request" },
+    { "id": "request", "type": "form", "next": "amount-check" },
+    {
+      "id": "amount-check",
+      "type": "condition",
+      "condition": { "field": "request.amount", "operator": "gte", "value": 10000 },
+      "then": "manual-review",
+      "else": "auto-approve"
+    },
+    { "id": "manual-review", "type": "action", "message": "Queued for finance review", "next": "pending" },
+    { "id": "auto-approve", "type": "action", "message": "Approved automatically", "next": "approved" },
+    { "id": "pending", "type": "end", "result": "pending-review" },
+    { "id": "approved", "type": "end", "result": "approved" }
+  ]
+}

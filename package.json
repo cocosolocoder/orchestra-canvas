@@ -1,0 +1,15 @@
+{
+  "name": "orchestra-canvas",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A small, deterministic workflow automation engine ready for product evolution.",
+  "scripts": {
+    "demo": "node src/cli.js demo",
+    "validate": "node src/cli.js validate examples/order-approval.json",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
