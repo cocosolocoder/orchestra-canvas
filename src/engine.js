@@ -3,6 +3,9 @@ const FIELD_TYPES = new Set(['string', 'number', 'integer', 'boolean']);
 const FORBIDDEN_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
 const STRING_BOUNDS = new Set(['minLength', 'maxLength']);
 const NUMBER_BOUNDS = new Set(['min', 'max']);
+const MAX_CONDITION_DEPTH = 32;
+const COMPOSITION_KEYS = ['all', 'any', 'not'];
+const CONDITION_OPERATORS = new Set(['eq', 'gte', 'lte', 'exists']);
 
 function assertPlainObject(value, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -12,6 +15,20 @@ function assertPlainObject(value, label) {
 
 function isUsableObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validateFieldPath(path, label) {
+  if (typeof path !== 'string' || path.length === 0) {
+    throw new Error(`${label}: path must be a non-empty string`);
+  }
+  const segments = path.split('.');
+  if (segments.some(part => part.length === 0)) {
+    throw new Error(`${label}: path must not contain empty segments`);
+  }
+  if (segments.some(part => FORBIDDEN_SEGMENTS.has(part))) {
+    throw new Error(`${label}: path must not contain __proto__, prototype or constructor segments`);
+  }
+  return segments;
 }
 
 function valueMatchesType(value, type) {
@@ -50,16 +67,7 @@ function compileFormSchema(node) {
     if (!isUsableObject(field)) {
       throw new Error(`${label}: field must be an object`);
     }
-    if (typeof field.path !== 'string' || field.path.length === 0) {
-      throw new Error(`form node ${node.id} field #${index}: path must be a non-empty string`);
-    }
-    const segments = field.path.split('.');
-    if (segments.some(part => part.length === 0)) {
-      throw new Error(`${label}: path must not contain empty segments`);
-    }
-    if (segments.some(part => FORBIDDEN_SEGMENTS.has(part))) {
-      throw new Error(`${label}: path must not contain __proto__, prototype or constructor segments`);
-    }
+    const segments = validateFieldPath(field.path, label);
     for (const previous of seenSegments) {
       const shared = Math.min(previous.length, segments.length);
       let prefix = true;
