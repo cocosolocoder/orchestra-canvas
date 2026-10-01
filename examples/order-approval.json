@@ -3,7 +3,18 @@
   "entry": "received",
   "nodes": [
     { "id": "received", "type": "trigger", "next": "request" },
-    { "id": "request", "type": "form", "next": "amount-check" },
+    {
+      "id": "request",
+      "type": "form",
+      "schema": {
+        "fields": [
+          { "path": "request.amount", "type": "number", "required": true, "min": 0 },
+          { "path": "request.department", "type": "string", "default": "General" },
+          { "path": "request.priority", "type": "string", "minLength": 1, "maxLength": 10 }
+        ]
+      },
+      "next": "amount-check"
+    },
     {
       "id": "amount-check",
       "type": "condition",
