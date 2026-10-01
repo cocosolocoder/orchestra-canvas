@@ -253,3 +253,222 @@ test('detects a reachable cycle', () => {
   };
   assert.throws(() => executeWorkflow(cyclic), /cycle is present/);
 });
+
+function conditionWorkflow(condition, { before = 'check' } = {}) {
+  const nodes = [
+    { id: 'start', type: 'trigger', next: before },
+    { id: 'check', type: 'condition', condition, then: 'pass', else: 'fail' },
+    { id: 'pass', type: 'end', result: 'passed' },
+    { id: 'fail', type: 'end', result: 'failed' },
+  ];
+  if (before === 'prep') {
+    nodes.splice(1, 0, { id: 'prep', type: 'action', message: 'prepared', next: 'check' });
+    nodes[0].next = 'prep';
+  }
+  return { id: 'conditions', entry: 'start', nodes };
+}
+
+const branchOf = (condition, input) => executeWorkflow(conditionWorkflow(condition), input).result;
+
+test('all, any and not combine conditions and can be nested', () => {
+  assert.equal(branchOf({ all: [{ field: 'a', operator: 'gte', value: 1 }, { field: 'b', operator: 'eq', value: 'x' }] }, { a: 2, b: 'x' }), 'passed');
+  assert.equal(branchOf({ all: [{ field: 'a', operator: 'gte', value: 1 }, { field: 'b', operator: 'eq', value: 'x' }] }, { a: 2, b: 'y' }), 'failed');
+  assert.equal(branchOf({ any: [{ field: 'a', operator: 'eq', value: 1 }, { field: 'b', operator: 'eq', value: 'x' }] }, { a: 2, b: 'x' }), 'passed');
+  assert.equal(branchOf({ any: [{ field: 'a', operator: 'eq', value: 1 }, { field: 'b', operator: 'eq', value: 'x' }] }, { a: 2, b: 'y' }), 'failed');
+  assert.equal(branchOf({ not: { field: 'a', operator: 'gte', value: 5 } }, { a: 1 }), 'passed');
+  assert.equal(branchOf({ not: { field: 'a', operator: 'gte', value: 5 } }, { a: 10 }), 'failed');
+
+  const nested = {
+    any: [
+      { all: [{ field: 'a', operator: 'exists' }, { field: 'b', operator: 'gte', valueField: 'a' }] },
+      { not: { field: 'c', operator: 'eq', value: false } },
+    ],
+  };
+  assert.equal(branchOf(nested, { a: '3', b: '4' }), 'passed');
+  assert.equal(branchOf(nested, { a: 4, b: 3, c: false }), 'failed');
+  assert.equal(branchOf(nested, { c: false }), 'failed');
+  assert.equal(branchOf(nested, { c: true }), 'passed');
+});
+
+test('exists treats null, empty string, 0 and false as present', () => {
+  for (const present of [null, '', 0, false]) {
+    assert.equal(branchOf({ field: 'x', operator: 'exists' }, { x: present }), 'passed');
+  }
+  assert.equal(branchOf({ field: 'x', operator: 'exists' }, {}), 'failed');
+  assert.equal(branchOf({ field: 'x.y', operator: 'exists' }, { x: 'y' }), 'failed');
+  assert.equal(branchOf({ field: 'x.y', operator: 'exists' }, { x: { y: null } }), 'passed');
+  assert.equal(branchOf({ not: { field: 'x', operator: 'exists' } }, {}), 'passed');
+});
+
+test('eq stays strictly equal and never coerces', () => {
+  assert.equal(branchOf({ field: 'x', operator: 'eq', value: 1 }, { x: 1 }), 'passed');
+  assert.equal(branchOf({ field: 'x', operator: 'eq', value: 1 }, { x: '1' }), 'failed');
+  assert.equal(branchOf({ field: 'x', operator: 'eq', value: null }, { x: null }), 'passed');
+  assert.equal(branchOf({ field: 'x', operator: 'eq', value: false }, { x: 0 }), 'failed');
+  assert.equal(branchOf({ field: 'x', operator: 'eq', value: 'yes' }, { x: 'yes' }), 'passed');
+  assert.equal(branchOf({ field: 'x', operator: 'eq', value: '' }, { x: 0 }), 'failed');
+});
+
+test('gte and lte convert numeric strings, booleans and null but require finite results', () => {
+  assert.equal(branchOf({ field: 'x', operator: 'gte', value: 0 }, { x: '10' }), 'passed');
+  assert.equal(branchOf({ field: 'x', operator: 'lte', value: 0 }, { x: '-5' }), 'passed');
+  assert.equal(branchOf({ field: 'x', operator: 'gte', value: 1 }, { x: true }), 'passed');
+  assert.equal(branchOf({ field: 'x', operator: 'lte', value: 0 }, { x: false }), 'passed');
+  assert.equal(branchOf({ field: 'x', operator: 'gte', value: null }, { x: null }), 'passed');
+  assert.equal(branchOf({ field: 'x', operator: 'gte', value: 0 }, { x: '' }), 'passed');
+});
+
+test('valueField compares two input fields and is exclusive with value', () => {
+  assert.equal(branchOf({ field: 'b', operator: 'gte', valueField: 'a' }, { a: '5', b: '6' }), 'passed');
+  assert.equal(branchOf({ field: 'b', operator: 'gte', valueField: 'a' }, { a: 6, b: 5 }), 'failed');
+  assert.equal(branchOf({ field: 'b', operator: 'gte', valueField: 'a' }, { b: 5 }), 'failed');
+  assert.equal(branchOf({ field: 'b', operator: 'gte', valueField: 'a' }, { a: 5 }), 'failed');
+  assert.equal(branchOf({ field: 'b', operator: 'eq', valueField: 'a' }, { a: null, b: null }), 'passed');
+});
+
+test('ordinary comparisons are false when any compared field is missing', () => {
+  assert.equal(branchOf({ field: 'x', operator: 'gte', value: 0 }, {}), 'failed');
+  assert.equal(branchOf({ field: 'a.b', operator: 'eq', value: 1 }, { a: null }), 'failed');
+});
+
+test('evaluated numeric comparisons on bad inputs stop execution as invalid_condition', () => {
+  const badInputs = [{ x: 'abc' }, { x: undefined }, { x: NaN }, { x: {} }, { x: [] }];
+  for (const input of badInputs) {
+    const execution = executeWorkflow(conditionWorkflow({ field: 'x', operator: 'gte', value: 0 }, { before: 'prep' }), input);
+    assert.equal(execution.status, 'invalid_condition');
+    assert.deepEqual(execution.context.input, input);
+    assert.equal(execution.context.output.prep, 'prepared');
+    assert.deepEqual(execution.trace, [
+      { nodeId: 'start', type: 'trigger' },
+      { nodeId: 'prep', type: 'action' },
+      { nodeId: 'check', type: 'condition' },
+    ]);
+    assert.match(execution.error, /condition node check at \$/);
+  }
+
+  const valueFieldSide = executeWorkflow(
+    conditionWorkflow({ field: 'x', operator: 'lte', valueField: 'y' }),
+    { x: 1, y: [] }
+  );
+  assert.equal(valueFieldSide.status, 'invalid_condition');
+  assert.match(valueFieldSide.error, /valueField/);
+
+  const nested = executeWorkflow(
+    conditionWorkflow({ all: [{ field: 'a', operator: 'gte', value: 0 }, { not: { field: 'b', operator: 'gte', value: 0 } }] }),
+    { a: 1, b: { nested: true } }
+  );
+  assert.equal(nested.status, 'invalid_condition');
+  assert.match(nested.error, /\$\.all\[1\]\.not/);
+});
+
+test('short-circuits in declaration order so skipped children never error', () => {
+  const input = { a: 1, bad: {} };
+  assert.equal(branchOf({ all: [{ field: 'a', operator: 'gte', value: 5 }, { field: 'bad', operator: 'gte', value: 0 }] }, input), 'failed');
+  assert.equal(branchOf({ any: [{ field: 'a', operator: 'gte', value: 0 }, { field: 'bad', operator: 'gte', value: 0 }] }, input), 'passed');
+  assert.equal(branchOf({ not: { all: [{ field: 'a', operator: 'gte', value: 5 }, { field: 'bad', operator: 'gte', value: 0 }] } }, input), 'passed');
+
+  // Once short-circuiting ends, later bad children are still evaluated.
+  assert.equal(executeWorkflow(conditionWorkflow({ all: [{ field: 'a', operator: 'gte', value: 0 }, { field: 'bad', operator: 'gte', value: 0 }] }), input).status, 'invalid_condition');
+  assert.equal(executeWorkflow(conditionWorkflow({ any: [{ field: 'a', operator: 'gte', value: 5 }, { field: 'bad', operator: 'gte', value: 0 }] }), input).status, 'invalid_condition');
+});
+
+test('eq never raises invalid_condition even for object inputs', () => {
+  assert.equal(branchOf({ field: 'x', operator: 'eq', value: 1 }, { x: {} }), 'failed');
+});
+
+test('rejects malformed condition definitions before execution, including untaken branches', () => {
+  const invalid = [
+    [{ field: 'x', operator: 'wat', value: 1 }, /unknown condition operator/],
+    [{ all: [] }, /all must not be empty/],
+    [{ any: [] }, /any must not be empty/],
+    [{ all: {} }, /all must be an array/],
+    [{ all: [null] }, /condition must be an object/],
+    [{ all: [{ field: 'x', operator: 'gte', value: 1 }, 5] }, /\$\.all\[1\].*condition must be an object/],
+    [{ not: [] }, /condition must be an object/],
+    [{ not: null }, /condition must be an object/],
+    [{ all: [{ field: 'x', operator: 'gte', value: 1 }], any: [{ field: 'y', operator: 'exists' }] }, /only one of all, any or not/],
+    [{ all: [{ field: 'x', operator: 'exists' }], field: 'x' }, /must not mix in/],
+    [{ field: 'x', operator: 'gte' }, /exactly one of value or valueField/],
+    [{ field: 'x', operator: 'gte', value: 1, valueField: 'y' }, /exactly one of value or valueField/],
+    [{ field: 'x', operator: 'gte', value: {} }, /value must be a string, finite number, boolean or null/],
+    [{ field: 'x', operator: 'gte', value: NaN }, /value must be/],
+    [{ field: 'x', operator: 'gte', value: ['x'] }, /value must be/],
+    [{ field: 'x', operator: 'gte', value: 'abc' }, /must convert to a finite number/],
+    [{ field: 'x', operator: 'exists', value: 1 }, /exists only takes field and operator/],
+    [{ field: 'x', operator: 'exists', valueField: 'y' }, /exists only takes field and operator/],
+    [{ field: '', operator: 'exists' }, /non-empty string/],
+    [{ field: 'a..b', operator: 'exists' }, /empty segments/],
+    [{ field: '__proto__', operator: 'exists' }, /__proto__/],
+    [{ field: 'x', operator: 'gte', value: 1, valueField: 5 }, /exactly one of/],
+    [{ field: 'x', operator: 'gte', valueField: 'constructor.x' }, /constructor/],
+    [{ operator: 'gte', value: 1 }, /comparison \(field and operator\)/],
+  ];
+  for (const [condition, matcher] of invalid) {
+    assert.throws(() => validateWorkflow(conditionWorkflow(condition)), matcher);
+  }
+
+  // A malformed condition sitting on an unreachable branch is still rejected.
+  const branched = {
+    id: 'untaken', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'check' },
+      { id: 'check', type: 'condition', condition: { field: 'route', operator: 'eq', value: 'a' }, then: 'a', else: 'b' },
+      { id: 'a', type: 'condition', condition: { field: 'x', operator: 'nope', value: 1 }, then: 'end', else: 'end' },
+      { id: 'b', type: 'end', result: 'b' },
+      { id: 'end', type: 'end', result: 'end' },
+    ],
+  };
+  assert.throws(() => executeWorkflow(branched, { route: 'b' }), /unknown condition operator/);
+});
+
+test('nests up to 32 levels and rejects the 33rd, reporting the position', () => {
+  const nested = depth => {
+    let condition = { field: 'x', operator: 'exists' };
+    for (let i = 1; i < depth; i += 1) condition = { not: condition };
+    return condition;
+  };
+  assert.doesNotThrow(() => validateWorkflow(conditionWorkflow(nested(32))));
+  assert.throws(() => validateWorkflow(conditionWorkflow(nested(33))), /nested deeper than 32 levels/);
+  try {
+    validateWorkflow(conditionWorkflow(nested(33)));
+  } catch (error) {
+    assert.match(error.message, /condition node check at \$\.not\.not/);
+  }
+});
+
+test('compound conditions see form defaults, failed forms still stop and roll back', () => {
+  const workflow = {
+    id: 'defaulted', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'collect' },
+      { id: 'collect', type: 'form', next: 'check', schema: { fields: [
+        { path: 'score', type: 'number', default: 90 },
+        { path: 'flag', type: 'boolean', default: true },
+      ] } },
+      { id: 'check', type: 'condition', condition: { all: [{ field: 'score', operator: 'gte', value: 80 }, { field: 'flag', operator: 'eq', value: true }] }, then: 'pass', else: 'fail' },
+      { id: 'pass', type: 'end', result: 'passed' },
+      { id: 'fail', type: 'end', result: 'failed' },
+    ],
+  };
+  assert.equal(executeWorkflow(workflow, {}).result, 'passed');
+
+  const failing = structuredClone(workflow);
+  failing.nodes[1].schema.fields.push({ path: 'required', type: 'string', required: true });
+  const execution = executeWorkflow(failing, {});
+  assert.equal(execution.status, 'invalid_input');
+  assert.deepEqual(execution.context.input, {});
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'collect']);
+});
+
+test('never mutates the definition or caller input and keeps runs independent', () => {
+  const workflow = conditionWorkflow({ all: [{ field: 'a', operator: 'gte', value: 1 }, { not: { field: 'b', operator: 'eq', value: null } }] });
+  const definitionSnapshot = JSON.stringify(workflow);
+  const caller = { a: '2', b: 'x' };
+  const inputSnapshot = JSON.stringify(caller);
+
+  assert.equal(executeWorkflow(workflow, caller).result, 'passed');
+  assert.equal(executeWorkflow(workflow, { a: 0, b: null }).result, 'failed');
+  assert.equal(executeWorkflow(workflow, caller).result, 'passed');
+
+  assert.equal(JSON.stringify(workflow), definitionSnapshot);
+  assert.equal(JSON.stringify(caller), inputSnapshot);
+});
+
