@@ -249,6 +249,111 @@ function compileCondition(condition, nodeId, position = '$', depth = 1) {
 
 const formSchemas = new WeakMap();
 const compiledConditions = new WeakMap();
+const successorTargets = new WeakMap();
+const nodeDependencies = new WeakMap();
+
+// Resolves the outgoing edges of a node. Trigger, form and action nodes may
+// name a single successor or a non-empty, duplicate-free array of successors;
+// conditions keep their then/else pair and end nodes have none.
+function normalizeSuccessors(node, nodes) {
+  if (node.type === 'end') return [];
+  if (node.type === 'condition') {
+    for (const destination of [node.then, node.else]) {
+      if (typeof destination !== 'string' || !nodes.has(destination)) {
+        throw new Error(`node ${node.id} points to an unknown destination`);
+      }
+    }
+    return [node.then, node.else];
+  }
+  const next = node.next;
+  if (Array.isArray(next)) {
+    if (next.length === 0) {
+      throw new Error(`node ${node.id}: next array must not be empty`);
+    }
+    const seen = new Set();
+    for (const destination of next) {
+      if (typeof destination !== 'string') {
+        throw new Error(`node ${node.id}: next array entries must be node id strings`);
+      }
+      if (seen.has(destination)) {
+        throw new Error(`node ${node.id}: duplicate destination ${destination}`);
+      }
+      seen.add(destination);
+      if (!nodes.has(destination)) {
+        throw new Error(`node ${node.id} points to an unknown destination`);
+      }
+    }
+    return [...seen];
+  }
+  if (typeof next !== 'string' || !nodes.has(next)) {
+    throw new Error(`node ${node.id} points to an unknown destination`);
+  }
+  return [next];
+}
+
+// Resolves the explicit dependencies of a node. Dependencies only gate when a
+// node may run; they never activate it. A missing dependsOn means no
+// dependencies, and the entry node must not declare any.
+function normalizeDependencies(node, nodes, entryId) {
+  if (!Object.hasOwn(node, 'dependsOn') || node.dependsOn === undefined) return [];
+  if (!Array.isArray(node.dependsOn)) {
+    throw new Error(`node ${node.id}: dependsOn must be an array`);
+  }
+  const seen = new Set();
+  for (const dependency of node.dependsOn) {
+    if (typeof dependency !== 'string') {
+      throw new Error(`node ${node.id}: dependsOn entries must be node id strings`);
+    }
+    if (seen.has(dependency)) {
+      throw new Error(`node ${node.id}: duplicate dependency ${dependency}`);
+    }
+    seen.add(dependency);
+    if (!nodes.has(dependency)) {
+      throw new Error(`node ${node.id} depends on an unknown node`);
+    }
+    if (dependency === node.id) {
+      throw new Error(`node ${node.id} must not depend on itself`);
+    }
+  }
+  const dependencies = [...seen];
+  if (node.id === entryId && dependencies.length > 0) {
+    throw new Error(`entry node ${node.id} must not declare dependencies`);
+  }
+  return dependencies;
+}
+
+// Successor edges and dependency ordering constraints together must stay
+// acyclic across the whole definition — including branches a run would never
+// take and nodes the entry cannot reach. The error names a node id chain
+// whose first and last entries match and whose steps are real edges or
+// dependency relations.
+function detectCycles(nodes) {
+  const adjacency = new Map([...nodes.keys()].map(id => [id, []]));
+  for (const [id, node] of nodes) {
+    adjacency.get(id).push(...successorTargets.get(node));
+    for (const dependency of nodeDependencies.get(node)) {
+      adjacency.get(dependency).push(id);
+    }
+  }
+  const color = new Map([...nodes.keys()].map(id => [id, 'white']));
+  const stack = [];
+  const visit = id => {
+    color.set(id, 'gray');
+    stack.push(id);
+    for (const target of adjacency.get(id)) {
+      if (color.get(target) === 'gray') {
+        const chain = [...stack.slice(stack.indexOf(target)), target];
+        throw new Error(`cycle is present: ${chain.join(' -> ')}`);
+      }
+      if (color.get(target) === 'white') visit(target);
+    }
+    stack.pop();
+    color.set(id, 'black');
+  };
+  for (const id of nodes.keys()) {
+    if (color.get(id) === 'white') visit(id);
+  }
+}
 
 export function validateWorkflow(workflow) {
   assertPlainObject(workflow, 'workflow');
@@ -266,13 +371,13 @@ export function validateWorkflow(workflow) {
   }
   if (!nodes.has(workflow.entry)) throw new Error(`entry node does not exist: ${workflow.entry}`);
 
+  let requiresSingleEnd = false;
   for (const node of nodes.values()) {
-    const destinations = node.type === 'condition' ? [node.then, node.else] : node.type === 'end' ? [] : [node.next];
-    for (const destination of destinations) {
-      if (typeof destination !== 'string' || !nodes.has(destination)) {
-        throw new Error(`node ${node.id} points to an unknown destination`);
-      }
-    }
+    successorTargets.set(node, normalizeSuccessors(node, nodes));
+    const dependencies = normalizeDependencies(node, nodes, workflow.entry);
+    nodeDependencies.set(node, dependencies);
+    const usesArraySuccessors = node.type !== 'end' && node.type !== 'condition' && Array.isArray(node.next);
+    if (usesArraySuccessors || dependencies.length > 0) requiresSingleEnd = true;
     if (node.type === 'form') {
       formSchemas.set(node, compileFormSchema(node));
     }
@@ -280,6 +385,15 @@ export function validateWorkflow(workflow) {
       compiledConditions.set(node, compileCondition(node.condition, node.id));
     }
   }
+
+  if (requiresSingleEnd) {
+    const endCount = [...nodes.values()].filter(node => node.type === 'end').length;
+    if (endCount !== 1) {
+      throw new Error('workflows using array successors or dependsOn must declare exactly one end node');
+    }
+  }
+
+  detectCycles(nodes);
   return nodes;
 }
 
@@ -405,32 +519,66 @@ export function executeWorkflow(workflow, input = {}) {
   const nodes = validateWorkflow(workflow);
   const trace = [];
   const context = { input: structuredClone(input), output: {} };
-  let currentId = workflow.entry;
+  const declarationOrder = [...nodes.values()];
+  const declarationIndex = new Map(declarationOrder.map((node, index) => [node.id, index]));
 
-  for (let step = 0; step <= nodes.size; step += 1) {
-    const node = nodes.get(currentId);
-    trace.push({ nodeId: node.id, type: node.type });
-    if (node.type === 'end') return { status: 'completed', result: node.result ?? null, context, trace };
-    if (node.type === 'action') context.output[node.id] = node.message ?? `action:${node.id}`;
-    if (node.type === 'form') {
-      const compiled = formSchemas.get(node);
+  // The entry starts active; every other node becomes active only when an
+  // actually traversed edge reaches it. Dependencies never activate a node,
+  // they only hold it back until every dependency completed successfully.
+  const activated = new Set([workflow.entry]);
+  const completed = new Set();
+  let endReached = false;
+  let endResult = null;
+
+  for (;;) {
+    const ready = declarationOrder.find(node =>
+      activated.has(node.id) && !completed.has(node.id)
+      && nodeDependencies.get(node).every(dependency => completed.has(dependency)));
+
+    if (!ready) {
+      const waiting = declarationOrder.filter(node => activated.has(node.id) && !completed.has(node.id));
+      if (waiting.length > 0) {
+        const blockedNodes = waiting.map(node => ({
+          nodeId: node.id,
+          missingDependencies: nodeDependencies.get(node)
+            .filter(dependency => !completed.has(dependency))
+            .sort((a, b) => declarationIndex.get(a) - declarationIndex.get(b)),
+        }));
+        return { status: 'blocked', context, trace, blockedNodes };
+      }
+      if (endReached) return { status: 'completed', result: endResult, context, trace };
+      throw new Error('workflow did not terminate; a cycle is present');
+    }
+
+    trace.push({ nodeId: ready.id, type: ready.type });
+    if (ready.type === 'end') {
+      // Reaching an end node records the result but never stops other
+      // activated branches; the run completes once nothing can still run.
+      endReached = true;
+      endResult = ready.result ?? null;
+      completed.add(ready.id);
+      continue;
+    }
+    if (ready.type === 'action') context.output[ready.id] = ready.message ?? `action:${ready.id}`;
+    if (ready.type === 'form') {
+      const compiled = formSchemas.get(ready);
       if (compiled) {
-        const formResult = processForm(node, context.input, compiled);
+        const formResult = processForm(ready, context.input, compiled);
         if (!formResult.ok) {
           context.input = formResult.rollback;
           return { status: 'invalid_input', context, trace, errors: formResult.errors };
         }
       }
     }
-    if (node.type === 'condition') {
-      const outcome = runCondition(compiledConditions.get(node), context.input, node.id);
+    if (ready.type === 'condition') {
+      const outcome = runCondition(compiledConditions.get(ready), context.input, ready.id);
       if (!outcome.ok) {
         return { status: 'invalid_condition', context, trace, error: outcome.error };
       }
-      currentId = outcome.value ? node.then : node.else;
+      activated.add(outcome.value ? ready.then : ready.else);
     } else {
-      currentId = node.next;
+      for (const target of successorTargets.get(ready)) activated.add(target);
     }
+    completed.add(ready.id);
   }
-  throw new Error('workflow did not terminate; a cycle is present');
 }

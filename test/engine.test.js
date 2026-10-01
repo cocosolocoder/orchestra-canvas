@@ -472,3 +472,235 @@ test('never mutates the definition or caller input and keeps runs independent', 
   assert.equal(JSON.stringify(caller), inputSnapshot);
 });
 
+function branchingWorkflow() {
+  return {
+    id: 'branching',
+    entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'collect' },
+      { id: 'collect', type: 'form', next: ['notify', 'audit'], schema: { fields: [
+        { path: 'score', type: 'number', default: 90 },
+      ] } },
+      { id: 'notify', type: 'action', message: 'notified', next: 'wrap' },
+      { id: 'audit', type: 'action', message: 'audited', next: 'wrap' },
+      { id: 'wrap', type: 'action', dependsOn: ['notify', 'audit'], next: 'done' },
+      { id: 'done', type: 'end', result: 'finished' },
+    ],
+  };
+}
+
+test('array successors activate every branch and a shared join waits for all of them', () => {
+  const execution = executeWorkflow(branchingWorkflow(), {});
+  assert.equal(execution.status, 'completed');
+  assert.equal(execution.result, 'finished');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'collect', 'notify', 'audit', 'wrap', 'done']);
+  assert.deepEqual(execution.context.output, { notify: 'notified', audit: 'audited', wrap: 'action:wrap' });
+  assert.deepEqual(execution.context.input, { score: 90 });
+});
+
+test('scheduling follows declaration order and dependencies only gate timing', () => {
+  const workflow = {
+    id: 'ordering', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: ['join', 'slow', 'fast'] },
+      { id: 'join', type: 'action', dependsOn: ['slow', 'fast'], next: 'done' },
+      { id: 'slow', type: 'action', next: 'done' },
+      { id: 'fast', type: 'action', next: 'done' },
+      { id: 'done', type: 'end', result: 'ordered' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'completed');
+  // join is declared first but waits for its dependencies; slow and fast run
+  // in declaration order before join becomes eligible.
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'slow', 'fast', 'join', 'done']);
+});
+
+test('an unchosen condition exit does not activate its target but a shared successor still activates', () => {
+  const workflow = {
+    id: 'shared', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'check' },
+      { id: 'check', type: 'condition', condition: { field: 'vip', operator: 'eq', value: true }, then: 'priority', else: 'standard' },
+      { id: 'priority', type: 'action', next: 'merge' },
+      { id: 'standard', type: 'action', next: 'merge' },
+      { id: 'merge', type: 'action', next: 'done' },
+      { id: 'done', type: 'end', result: 'merged' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, { vip: false });
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'check', 'standard', 'merge', 'done']);
+  assert.deepEqual(Object.keys(execution.context.output), ['standard', 'merge']);
+});
+
+test('activated nodes waiting on never-completing dependencies report blocked with ordered details', () => {
+  const workflow = {
+    id: 'blocked', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'check' },
+      { id: 'check', type: 'condition', condition: { field: 'vip', operator: 'eq', value: true }, then: 'priority', else: 'standard' },
+      { id: 'priority', type: 'action', next: 'wrap' },
+      { id: 'standard', type: 'action', next: 'wrap' },
+      { id: 'wrap', type: 'action', dependsOn: ['standard', 'priority'], next: 'done' },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, { vip: true });
+  assert.equal(execution.status, 'blocked');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'check', 'priority']);
+  assert.deepEqual(Object.keys(execution.context.output), ['priority']);
+  // missingDependencies follow nodes declaration order, not dependsOn order.
+  assert.deepEqual(execution.blockedNodes, [{ nodeId: 'wrap', missingDependencies: ['standard'] }]);
+});
+
+test('other branches keep running while a node waits, and end does not finish the run early', () => {
+  const workflow = {
+    id: 'late-end', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: ['finish', 'work'] },
+      { id: 'finish', type: 'end', result: 'early' },
+      { id: 'work', type: 'action', next: 'more' },
+      { id: 'more', type: 'action', next: 'finish' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'completed');
+  assert.equal(execution.result, 'early');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'finish', 'work', 'more']);
+  assert.deepEqual(execution.context.output, { work: 'action:work', more: 'action:more' });
+});
+
+test('a failing form on one branch stops the run, rolls back its defaults and keeps prior output', () => {
+  const workflow = {
+    id: 'branch-failure', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: ['prep', 'collect'] },
+      { id: 'prep', type: 'action', message: 'prepared', next: 'done' },
+      { id: 'collect', type: 'form', next: 'done', schema: { fields: [
+        { path: 'a.b', type: 'string', default: 'B' },
+        { path: 'a.c', type: 'string', required: true },
+      ] } },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'invalid_input');
+  assert.deepEqual(execution.context.input, {});
+  assert.deepEqual(execution.context.output, { prep: 'prepared' });
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'prep', 'collect']);
+});
+
+test('branching runs never mutate the definition or caller input and stay independent', () => {
+  const workflow = branchingWorkflow();
+  const definitionSnapshot = JSON.stringify(workflow);
+  const caller = { note: 'hi' };
+  const first = executeWorkflow(workflow, caller);
+  const second = executeWorkflow(workflow, {});
+  assert.equal(first.status, 'completed');
+  assert.equal(second.status, 'completed');
+  assert.deepEqual(caller, { note: 'hi' });
+  assert.deepEqual(first.context.input, { note: 'hi', score: 90 });
+  assert.deepEqual(second.context.input, { score: 90 });
+  assert.equal(JSON.stringify(workflow), definitionSnapshot);
+});
+
+test('rejects malformed successor arrays and dependency declarations', () => {
+  const base = () => ({
+    id: 'invalid', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'done' },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  });
+  const withNodes = mutate => {
+    const workflow = base();
+    mutate(workflow);
+    return workflow;
+  };
+  const cases = [
+    [w => { w.nodes[0].next = []; }, /next array must not be empty/],
+    [w => { w.nodes[0].next = ['done', 'done']; }, /duplicate destination/],
+    [w => { w.nodes[0].next = [5]; }, /must be node id strings/],
+    [w => { w.nodes[0].next = ['ghost']; }, /unknown destination/],
+    [w => { w.nodes[0].dependsOn = 'done'; }, /dependsOn must be an array/],
+    [w => { w.nodes[0].dependsOn = [null]; }, /must be node id strings/],
+    [w => { w.nodes[1].dependsOn = ['start', 'start']; }, /duplicate dependency/],
+    [w => { w.nodes[1].dependsOn = ['ghost']; }, /unknown node/],
+    [w => { w.nodes[1].dependsOn = ['done']; }, /depend on itself/],
+    [w => { w.nodes[0].dependsOn = ['done']; }, /entry node start must not declare dependencies/],
+  ];
+  for (const [mutate, matcher] of cases) {
+    assert.throws(() => validateWorkflow(withNodes(mutate)), matcher);
+  }
+});
+
+test('workflows using array successors or dependsOn must declare exactly one end node', () => {
+  const twoEnds = {
+    id: 'ends', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'end', result: 'a' },
+      { id: 'b', type: 'end', result: 'b' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(twoEnds), /exactly one end node/);
+
+  const noEnd = {
+    id: 'ends', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'b' },
+      { id: 'b', type: 'action', next: 'a' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(noEnd), /exactly one end node|cycle is present/);
+
+  // Legacy single-successor workflows keep allowing multiple end nodes.
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+});
+
+test('rejects cycles formed by edges, dependencies or both, including unreachable nodes', () => {
+  const edgeCycle = {
+    id: 'c1', entry: 'a',
+    nodes: [
+      { id: 'a', type: 'trigger', next: 'b' },
+      { id: 'b', type: 'action', next: 'a' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(edgeCycle), /cycle is present: a -> b -> a/);
+
+  const dependencyCycle = {
+    id: 'c2', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'done' },
+      { id: 'x', type: 'action', dependsOn: ['y'], next: 'done' },
+      { id: 'y', type: 'action', dependsOn: ['x'], next: 'done' },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(dependencyCycle), /cycle is present: x -> y -> x/);
+
+  const mixedCycle = {
+    id: 'c3', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'a' },
+      { id: 'a', type: 'action', dependsOn: ['b'], next: 'b' },
+      { id: 'b', type: 'action', next: 'done' },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(mixedCycle), /cycle is present: a -> b -> a/);
+
+  const unreachableCycle = {
+    id: 'c4', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'done' },
+      { id: 'done', type: 'end', result: 'done' },
+      { id: 'lost1', type: 'action', next: 'lost2' },
+      { id: 'lost2', type: 'action', next: 'lost1' },
+    ],
+  };
+  assert.throws(() => executeWorkflow(unreachableCycle, {}), /cycle is present: lost1 -> lost2 -> lost1/);
+});
+
