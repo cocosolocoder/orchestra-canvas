@@ -472,3 +472,405 @@ test('never mutates the definition or caller input and keeps runs independent', 
   assert.equal(JSON.stringify(caller), inputSnapshot);
 });
 
+// --- multi-branch successors -------------------------------------------------
+
+test('array successors activate every branch and run a shared end once', () => {
+  const workflow = {
+    id: 'fanout', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'end' },
+      { id: 'b', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'completed');
+  assert.equal(execution.result, 'done');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a', 'b', 'end']);
+  assert.deepEqual(execution.context.output, { a: 'action:a', b: 'action:b' });
+});
+
+test('a shared successor reached by several edges runs exactly once', () => {
+  const workflow = {
+    id: 'merge', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'c' },
+      { id: 'b', type: 'action', next: 'c' },
+      { id: 'c', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a', 'b', 'c', 'end']);
+  assert.deepEqual(execution.context.output, { a: 'action:a', b: 'action:b', c: 'action:c' });
+});
+
+test('condition outlets may be arrays; the unselected outlet never activates', () => {
+  const workflow = {
+    id: 'cond-fanout', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'check' },
+      { id: 'check', type: 'condition', condition: { field: 'use', operator: 'eq', value: true }, then: ['a', 'b'], else: ['skip'] },
+      { id: 'a', type: 'action', next: 'end' },
+      { id: 'b', type: 'action', next: 'end' },
+      { id: 'skip', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const taken = executeWorkflow(workflow, { use: true });
+  assert.deepEqual(taken.trace.map(n => n.nodeId), ['start', 'check', 'a', 'b', 'end']);
+  assert.deepEqual(taken.context.output, { a: 'action:a', b: 'action:b' });
+
+  const notTaken = executeWorkflow(workflow, { use: false });
+  assert.deepEqual(notTaken.trace.map(n => n.nodeId), ['start', 'check', 'skip', 'end']);
+  assert.deepEqual(notTaken.context.output, { skip: 'action:skip' });
+});
+
+test('a shared successor is still activated by another traversed edge', () => {
+  const workflow = {
+    id: 'shared', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['check', 'b'] },
+      { id: 'check', type: 'condition', condition: { field: 'use', operator: 'eq', value: true }, then: ['c'], else: ['c'] },
+      { id: 'b', type: 'action', next: 'c' },
+      { id: 'c', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  for (const use of [true, false]) {
+    const execution = executeWorkflow(workflow, { use });
+    assert.equal(execution.status, 'completed');
+    assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'check', 'b', 'c', 'end']);
+  }
+});
+
+test('reaching an end does not terminate other activated branches early', () => {
+  const workflow = {
+    id: 'no-early', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'end'] },
+      { id: 'a', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a', 'end']);
+  assert.deepEqual(execution.context.output, { a: 'action:a' });
+});
+
+test('a failed form stops the whole run, leaving other branches unexecuted', () => {
+  const workflow = {
+    id: 'fail-fast', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'form', next: 'end', schema: { fields: [{ path: 'x', type: 'string', required: true }] } },
+      { id: 'b', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'invalid_input');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a']);
+  assert.deepEqual(execution.context.output, {});
+});
+
+// --- dependsOn ----------------------------------------------------------------
+
+test('dependsOn delays a node until its dependencies complete, but never activates it', () => {
+  const workflow = {
+    id: 'join', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'c' },
+      { id: 'b', type: 'action', dependsOn: ['c'], next: 'end' },
+      { id: 'c', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a', 'c', 'b', 'end']);
+  assert.deepEqual(execution.context.output, { a: 'action:a', c: 'action:c', b: 'action:b' });
+});
+
+test('a node that is never activated is not executed and produces no output', () => {
+  const workflow = {
+    id: 'dormant', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'end' },
+      { id: 'b', type: 'action', next: 'end' },
+      { id: 'c', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a', 'b', 'end']);
+  assert.deepEqual(execution.context.output, { a: 'action:a', b: 'action:b' });
+  assert.equal(execution.context.output.c, undefined);
+});
+
+test('returns blocked with waiting nodes and their missing dependencies in declaration order', () => {
+  const workflow = {
+    id: 'blocked', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'end' },
+      { id: 'b', type: 'action', dependsOn: ['d', 'c'], next: 'end' },
+      { id: 'c', type: 'action', next: 'end' },
+      { id: 'd', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'blocked');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a', 'end']);
+  assert.deepEqual(execution.blockedNodes, [
+    { nodeId: 'b', missingDependencies: ['c', 'd'] },
+  ]);
+  assert.deepEqual(execution.context.output, { a: 'action:a' });
+});
+
+test('blocked lists every waiting node in declaration order', () => {
+  const workflow = {
+    id: 'blocked-many', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', dependsOn: ['c'], next: 'end' },
+      { id: 'b', type: 'action', dependsOn: ['c'], next: 'end' },
+      { id: 'c', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'blocked');
+  assert.deepEqual(execution.blockedNodes, [
+    { nodeId: 'a', missingDependencies: ['c'] },
+    { nodeId: 'b', missingDependencies: ['c'] },
+  ]);
+});
+
+test('an end node can wait on dependencies before producing its result', () => {
+  const workflow = {
+    id: 'end-join', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'end' },
+      { id: 'b', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', dependsOn: ['a', 'b'], result: 'joined' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'completed');
+  assert.equal(execution.result, 'joined');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a', 'b', 'end']);
+});
+
+test('dependencies are satisfied only by completed nodes, not merely activated ones', () => {
+  const workflow = {
+    id: 'timing', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'c' },
+      { id: 'b', type: 'action', dependsOn: ['c'], next: 'end' },
+      { id: 'c', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const execution = executeWorkflow(workflow, {});
+  assert.equal(execution.status, 'completed');
+  // b is declared before c, but must wait until c completes.
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a', 'c', 'b', 'end']);
+});
+
+// --- single end rule ----------------------------------------------------------
+
+test('workflows using array successors or dependsOn must have exactly one end', () => {
+  const twoEnds = {
+    id: 'two', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'end', result: 'a' },
+      { id: 'b', type: 'end', result: 'b' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(twoEnds), /exactly one end node/);
+
+  const dependsTwoEnds = {
+    id: 'two-dep', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'a' },
+      { id: 'a', type: 'action', dependsOn: ['b'], next: 'end1' },
+      { id: 'b', type: 'end', result: 'b' },
+      { id: 'end1', type: 'end', result: 'e1' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(dependsTwoEnds), /exactly one end node/);
+
+  // Legacy workflows with plain string outlets keep allowing multiple ends.
+  const legacy = {
+    id: 'legacy', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'check' },
+      { id: 'check', type: 'condition', condition: { field: 'x', operator: 'exists' }, then: 'a', else: 'b' },
+      { id: 'a', type: 'end', result: 'a' },
+      { id: 'b', type: 'end', result: 'b' },
+    ],
+  };
+  assert.doesNotThrow(() => validateWorkflow(legacy));
+});
+
+// --- definition validation ----------------------------------------------------
+
+test('rejects malformed successor arrays', () => {
+  const base = {
+    id: 'bad', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'a' },
+      { id: 'a', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const cases = [
+    [w => { w.nodes[0].next = []; }, /empty array/],
+    [w => { w.nodes[0].next = ['a', 'a']; }, /duplicate ids/],
+    [w => { w.nodes[0].next = ['a', 1]; }, /only node ids/],
+    [w => { w.nodes[0].next = ['missing']; }, /unknown destination/],
+    [w => { w.nodes[0].next = 'missing'; }, /unknown destination/],
+    [w => { w.nodes[0].next = null; }, /unknown destination/],
+  ];
+  for (const [mutate, matcher] of cases) {
+    const workflow = structuredClone(base);
+    mutate(workflow);
+    assert.throws(() => validateWorkflow(workflow), matcher);
+  }
+});
+
+test('rejects malformed dependsOn declarations', () => {
+  const base = {
+    id: 'bad-dep', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'a' },
+      { id: 'a', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const cases = [
+    [w => { w.nodes[1].dependsOn = 'a'; }, /dependsOn must be an array/],
+    [w => { w.nodes[1].dependsOn = [1]; }, /only node ids/],
+    [w => { w.nodes[1].dependsOn = ['missing']; }, /unknown node/],
+    [w => { w.nodes[1].dependsOn = ['a']; }, /must not reference itself/],
+    [w => { w.nodes[1].dependsOn = ['end', 'end']; }, /duplicate ids/],
+    [w => { w.nodes[0].dependsOn = ['a']; }, /entry node .* must not declare dependencies/],
+  ];
+  for (const [mutate, matcher] of cases) {
+    const workflow = structuredClone(base);
+    mutate(workflow);
+    assert.throws(() => validateWorkflow(workflow), matcher);
+  }
+});
+
+test('accepts an empty dependsOn array as the default', () => {
+  const workflow = {
+    id: 'empty-dep', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'a', dependsOn: [] },
+      { id: 'a', type: 'action', next: 'end', dependsOn: [] },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+});
+
+// --- cycle detection ----------------------------------------------------------
+
+test('rejects cycles over flow edges, dependency edges, or both', () => {
+  const flowCycle = {
+    id: 'flow', entry: 'a', nodes: [
+      { id: 'a', type: 'trigger', next: 'b' },
+      { id: 'b', type: 'action', next: 'a' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(flowCycle), /cycle is present: a -> b -> a/);
+
+  const dependencyCycle = {
+    id: 'dep', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'a' },
+      { id: 'a', type: 'action', dependsOn: ['b'], next: 'end' },
+      { id: 'b', type: 'action', dependsOn: ['a'], next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(dependencyCycle), /cycle is present: a -> b -> a/);
+
+  const mixedCycle = {
+    id: 'mixed', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'a' },
+      { id: 'a', type: 'action', next: 'b', dependsOn: ['b'] },
+      { id: 'b', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(mixedCycle), /cycle is present: a -> b -> a/);
+});
+
+test('cycle detection includes unreachable nodes and unselected branches', () => {
+  const workflow = {
+    id: 'unreachable-cycle', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+      { id: 'a', type: 'action', next: 'b' },
+      { id: 'b', type: 'action', next: 'a' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(workflow), /cycle is present: a -> b -> a/);
+});
+
+test('cycle chains start and end with the same id and each step is a real relation', () => {
+  const workflow = {
+    id: 'chain', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'a' },
+      { id: 'a', type: 'action', next: 'b' },
+      { id: 'b', type: 'action', next: 'c' },
+      { id: 'c', type: 'action', next: 'a', dependsOn: ['b'] },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  try {
+    validateWorkflow(workflow);
+    assert.fail('expected a cycle error');
+  } catch (error) {
+    assert.match(error.message, /cycle is present: a -> b -> c -> a/);
+  }
+});
+
+// --- immutability across runs -------------------------------------------------
+
+test('array successors and dependencies never mutate the definition or caller input', () => {
+  const workflow = {
+    id: 'immutable', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'form', next: 'end', schema: { fields: [{ path: 'x', type: 'number', default: 1 }] } },
+      { id: 'b', type: 'action', dependsOn: ['a'], next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const definitionSnapshot = JSON.stringify(workflow);
+  const caller = { y: 2 };
+  const inputSnapshot = JSON.stringify(caller);
+
+  const first = executeWorkflow(workflow, caller);
+  const second = executeWorkflow(workflow, caller);
+  assert.equal(first.status, 'completed');
+  assert.equal(second.status, 'completed');
+  assert.deepEqual(first.context.output, second.context.output);
+  assert.deepEqual(first.context.input, second.context.input);
+
+  assert.equal(JSON.stringify(workflow), definitionSnapshot);
+  assert.equal(JSON.stringify(caller), inputSnapshot);
+});
+
+test('multiple runs have independent state and outputs', () => {
+  const workflow = {
+    id: 'independent', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'end' },
+      { id: 'b', type: 'action', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  const first = executeWorkflow(workflow, {});
+  const second = executeWorkflow(workflow, {});
+  assert.notEqual(first.context, second.context);
+  assert.notEqual(first.trace, second.trace);
+  assert.deepEqual(first.context.output, second.context.output);
+});
+
+
