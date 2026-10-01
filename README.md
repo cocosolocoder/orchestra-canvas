@@ -81,3 +81,63 @@ Missing fields take their defaults first; a missing non-required field without a
 When validation fails, execution returns `status: "invalid_input"` with the preserved `context` and `trace` and an `errors` array. Errors are collected in field declaration order, one per field, in the priority `required` → `type` → `range`/`length`. Later nodes do not run, and every default the failed form applied is rolled back. Undeclared input fields are always retained.
 
 Workflow definition (`validateWorkflow`, also run at the start of execution) checks every form schema and every condition tree in the workflow — including branches that will not be traversed — and reports the offending node, field, and condition position before execution. At runtime, only forms on the traversed path are validated, so a missing input in an untaken branch is not an error.
+
+## Business actions
+
+An `action` node either keeps its legacy behavior (`message`, defaulting to `action:<nodeId>`) or performs a real business operation. Name the operation on the node and supply implementations by name when running:
+
+```json
+{
+  "id": "charge-card",
+  "type": "action",
+  "operation": "charge",
+  "retry": { "attempts": 3, "initialDelayMs": 100, "backoffFactor": 2, "maxDelayMs": 1000 },
+  "next": "receipt"
+}
+```
+
+```js
+import { executeWorkflowAsync } from './src/engine.js';
+
+const result = await executeWorkflowAsync(workflow, input, {
+  charge: async (input, output, nodeId, attempt) => { ... },
+});
+```
+
+`executeWorkflowAsync(workflow, input?, operations?)` is the asynchronous entry point. Legacy message actions, forms, conditions, branching, dependencies and join semantics work exactly as in `executeWorkflow`; that synchronous entry, `validateWorkflow`, and the command-line demo continue to work unchanged. If a validated workflow names any business operation, `executeWorkflow` rejects before the first node executes, naming the node and explaining that the workflow must run through `executeWorkflowAsync`.
+
+An implementation is called as `operation(input, output, nodeId, attempt)`:
+
+- `input` — an independent structured clone of the run's current input.
+- `output` — an independent structured clone of every earlier successful node output.
+- `nodeId` — the running node's id; `attempt` starts at `1`.
+- it may return a value or a Promise; the resolved value is structured-cloned and stored as that node's output, so later mutation of an object the implementation keeps cannot touch the run.
+
+Mutations made to the copies during a failed attempt never reach later attempts or the run context. A thrown exception, a rejected Promise, or a return value that cannot be structured-cloned all count as a failed attempt. The original caller input, the workflow definition, and other runs are never mutated.
+
+Retry configuration (`retry`) is either omitted — exactly one attempt — or present with all four fields:
+
+- `attempts` — integer from `1` to `10`.
+- `initialDelayMs` / `maxDelayMs` — integers from `0` to `60000` milliseconds; `maxDelayMs` must not be smaller than `initialDelayMs`.
+- `backoffFactor` — a finite number from `1` to `4`.
+
+The first retry waits `initialDelayMs`; each later wait grows by `backoffFactor` and is capped at `maxDelayMs` (a zero initial delay always stays zero). No wait happens after the final attempt.
+
+Before the run starts — covering untaken branches and entry-unreachable nodes — every action's operation name and retry config is validated (a name must be a non-blank string, and all parameter rules above apply), and every named operation must exist in `operations` as a function. Any violation throws with the node id and reason without invoking an operation even once.
+
+Nodes still execute one at a time in declaration order: while an action waits or retries, no other node is scheduled. Successors activate and dependencies satisfy only after the action succeeds, and a shared join still runs exactly once. When retries are exhausted the run immediately returns:
+
+```json
+{
+  "status": "action_failed",
+  "nodeId": "charge-card",
+  "attempts": 3,
+  "error": "last failure message",
+  "context": { "input": {}, "output": {} },
+  "trace": [ ... ],
+  "actionAttempts": [ ... ]
+}
+```
+
+Earlier input and successful outputs are preserved, the failed node has no output, no later node runs, and reaching an `end` node earlier does not make the run `completed`. Every result from `executeWorkflowAsync` also carries `actionAttempts`: records in invocation order, each `{ nodeId, attempt, ok, error, nextDelayMs }`, where `nextDelayMs` is the wait before the next attempt or `0` when none follows. The regular `trace` still lists each actually executed node exactly once. Form failures (`invalid_input`), condition failures (`invalid_condition`) and dependency blocking (`blocked`) keep their existing result shapes.
+
