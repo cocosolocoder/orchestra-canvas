@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { executeWorkflow, validateWorkflow } from '../src/engine.js';
+import { executeWorkflow, executeWorkflowAsync, validateWorkflow } from '../src/engine.js';
 
 const workflow = {
   id: 'routing',
@@ -702,5 +702,347 @@ test('rejects cycles formed by edges, dependencies or both, including unreachabl
     ],
   };
   assert.throws(() => executeWorkflow(unreachableCycle, {}), /cycle is present: lost1 -> lost2 -> lost1/);
+});
+
+// --- Business actions with retries ---
+
+function businessWorkflow(operation, { retry, next = 'done' } = {}) {
+  return {
+    id: 'business', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'do' },
+      { id: 'do', type: 'action', operation, ...(retry !== undefined ? { retry } : {}), next },
+      { id: 'done', type: 'end', result: 'finished' },
+    ],
+  };
+}
+
+test('async entry runs a business operation and stores its result', async () => {
+  const calls = [];
+  const operations = {
+    greet: async (input, output, nodeId, attempt) => {
+      calls.push({ nodeId, attempt, input, output });
+      return { echoed: input.name, attempt };
+    },
+  };
+  const execution = await executeWorkflowAsync(businessWorkflow('greet'), { name: 'Ada' }, operations);
+  assert.equal(execution.status, 'completed');
+  assert.equal(execution.result, 'finished');
+  assert.deepEqual(execution.context.output.do, { echoed: 'Ada', attempt: 1 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].nodeId, 'do');
+  assert.equal(calls[0].attempt, 1);
+  assert.deepEqual(calls[0].input, { name: 'Ada' });
+  assert.deepEqual(calls[0].output, {});
+  assert.deepEqual(execution.trace, [
+    { nodeId: 'start', type: 'trigger' },
+    { nodeId: 'do', type: 'action' },
+    { nodeId: 'done', type: 'end' },
+  ]);
+});
+
+test('operations receive the current successful outputs as a copy', async () => {
+  const received = [];
+  const workflow = {
+    id: 'outputs', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'first' },
+      { id: 'first', type: 'action', message: 'first-msg', next: 'second' },
+      { id: 'second', type: 'action', operation: 'op', next: 'done' },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  };
+  const operations = {
+    op: (input, output) => { received.push({ input, output }); return { got: true }; },
+  };
+  const execution = await executeWorkflowAsync(workflow, { x: 1 }, operations);
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(received[0].input, { x: 1 });
+  assert.deepEqual(received[0].output, { first: 'first-msg' });
+  assert.deepEqual(execution.context.output, { first: 'first-msg', second: { got: true } });
+});
+
+test('operations receive independent copies and stored returns are independent', async () => {
+  const caller = { original: true };
+  const returned = { nested: { value: 1 } };
+  const operations = {
+    copy: input => {
+      input.mutated = true;
+      return returned;
+    },
+  };
+  const execution = await executeWorkflowAsync(businessWorkflow('copy'), caller, operations);
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(caller, { original: true });
+  assert.equal(execution.context.input.mutated, undefined);
+  // The stored value is a clone, independent of the operation's held object.
+  assert.notEqual(execution.context.output.do, returned);
+  assert.notEqual(execution.context.output.do.nested, returned.nested);
+  assert.deepEqual(execution.context.output.do, { nested: { value: 1 } });
+  returned.nested.value = 999;
+  assert.equal(execution.context.output.do.nested.value, 1);
+});
+
+test('retries until success and records each attempt with its wait', async () => {
+  let attempt = 0;
+  const operations = {
+    flaky: () => {
+      attempt += 1;
+      if (attempt < 3) throw new Error('boom');
+      return { ok: true, attempt };
+    },
+  };
+  const execution = await executeWorkflowAsync(
+    businessWorkflow('flaky', { retry: { attempts: 5, initialDelay: 1, backoff: 2, maxDelay: 10 } }),
+    {}, operations
+  );
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(execution.context.output.do, { ok: true, attempt: 3 });
+  assert.equal(attempt, 3);
+  assert.equal(execution.attemptRecords.length, 3);
+  assert.equal(execution.attemptRecords[0].ok, false);
+  assert.equal(execution.attemptRecords[0].attempt, 1);
+  assert.equal(execution.attemptRecords[0].waitMs, 1);
+  assert.match(execution.attemptRecords[0].error.message, /boom/);
+  assert.equal(execution.attemptRecords[1].ok, false);
+  assert.equal(execution.attemptRecords[1].waitMs, 2);
+  assert.equal(execution.attemptRecords[2].ok, true);
+  assert.equal(execution.attemptRecords[2].waitMs, 0);
+});
+
+test('retry exhaustion returns action_failed and stops the run', async () => {
+  const operations = { always: () => { throw new Error('nope'); } };
+  const workflow = {
+    id: 'fail', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'do' },
+      { id: 'do', type: 'action', operation: 'always', retry: { attempts: 2, initialDelay: 1, backoff: 2, maxDelay: 10 }, next: 'after' },
+      { id: 'after', type: 'action', message: 'should not run', next: 'done' },
+      { id: 'done', type: 'end', result: 'finished' },
+    ],
+  };
+  const execution = await executeWorkflowAsync(workflow, {}, operations);
+  assert.equal(execution.status, 'action_failed');
+  assert.equal(execution.nodeId, 'do');
+  assert.equal(execution.attempts, 2);
+  assert.match(execution.error.message, /nope/);
+  assert.equal(execution.context.output.do, undefined);
+  assert.equal(execution.context.output.after, undefined);
+  assert.deepEqual(execution.trace, [
+    { nodeId: 'start', type: 'trigger' },
+    { nodeId: 'do', type: 'action' },
+  ]);
+  assert.equal(execution.attemptRecords.length, 2);
+  assert.equal(execution.attemptRecords[0].waitMs, 1);
+  assert.equal(execution.attemptRecords[1].waitMs, 0);
+});
+
+test('rejected promises and non-cloneable returns count as failures', async () => {
+  const operations = {
+    reject: async () => { throw new Error('rejected'); },
+    uncloneable: () => () => {},
+  };
+  const retry = { attempts: 1, initialDelay: 0, backoff: 1, maxDelay: 0 };
+  const rejected = await executeWorkflowAsync(businessWorkflow('reject', { retry }), {}, operations);
+  assert.equal(rejected.status, 'action_failed');
+  assert.match(rejected.error.message, /rejected/);
+
+  const uncloneable = await executeWorkflowAsync(businessWorkflow('uncloneable', { retry }), {}, operations);
+  assert.equal(uncloneable.status, 'action_failed');
+  assert.equal(uncloneable.attemptRecords[0].ok, false);
+});
+
+test('backoff grows and is capped, with no wait after the last attempt', async () => {
+  const operations = { always: () => { throw new Error('x'); } };
+  const execution = await executeWorkflowAsync(
+    businessWorkflow('always', { retry: { attempts: 5, initialDelay: 100, backoff: 2, maxDelay: 300 } }),
+    {}, operations
+  );
+  assert.equal(execution.status, 'action_failed');
+  assert.deepEqual(execution.attemptRecords.map(r => r.waitMs), [100, 200, 300, 300, 0]);
+});
+
+test('omitting retry config tries exactly once', async () => {
+  let calls = 0;
+  const operations = { once: () => { calls += 1; throw new Error('x'); } };
+  const execution = await executeWorkflowAsync(businessWorkflow('once'), {}, operations);
+  assert.equal(execution.status, 'action_failed');
+  assert.equal(calls, 1);
+  assert.equal(execution.attempts, 1);
+  assert.equal(execution.attemptRecords.length, 1);
+  assert.equal(execution.attemptRecords[0].waitMs, 0);
+});
+
+test('failed attempt mutations do not leak into the next attempt or run context', async () => {
+  const seen = [];
+  const operations = {
+    leak: input => {
+      seen.push({ ...input });
+      input.attempt = (input.attempt ?? 0) + 1;
+      if (seen.length < 2) throw new Error('retry');
+      return { final: true };
+    },
+  };
+  const execution = await executeWorkflowAsync(
+    businessWorkflow('leak', { retry: { attempts: 3, initialDelay: 1, backoff: 1, maxDelay: 1 } }),
+    { value: 1 }, operations
+  );
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(seen, [{ value: 1 }, { value: 1 }]);
+  assert.equal(execution.context.input.attempt, undefined);
+});
+
+test('sync entry rejects business operations before any node runs', () => {
+  const workflow = businessWorkflow('greet');
+  assert.throws(() => executeWorkflow(workflow, {}), /action node do.*requires executeWorkflowAsync/);
+  // The definition itself remains valid; only the sync execution entry rejects it.
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+});
+
+test('validates operation names and implementations before running, including unreachable nodes', async () => {
+  const cases = [
+    [5, /operation name must be a non-empty string/],
+    ['   ', /operation name must be a non-empty string/],
+    ['missing', /not implemented/],
+  ];
+  for (const [operation, matcher] of cases) {
+    await assert.rejects(() => executeWorkflowAsync(businessWorkflow(operation), {}, {}), matcher);
+  }
+
+  let called = false;
+  const operations = { good: () => { called = true; return {}; } };
+  const workflow = {
+    id: 'unreachable', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'good' },
+      { id: 'good', type: 'action', operation: 'good', next: 'end' },
+      { id: 'bad', type: 'action', operation: '  ', next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  await assert.rejects(() => executeWorkflowAsync(workflow, {}, operations), /operation name/);
+  assert.equal(called, false);
+});
+
+test('business operations are never called when validation fails', async () => {
+  let called = false;
+  const operations = { op: () => { called = true; return {}; } };
+  const workflow = businessWorkflow('op', { retry: { attempts: 0, initialDelay: 0, backoff: 1, maxDelay: 0 } });
+  await assert.rejects(() => executeWorkflowAsync(workflow, {}, operations), /attempts/);
+  assert.equal(called, false);
+});
+
+test('validates retry config bounds before running', async () => {
+  const cases = [
+    [{ attempts: 0, initialDelay: 0, backoff: 1, maxDelay: 0 }, /attempts must be an integer between 1 and 10/],
+    [{ attempts: 11, initialDelay: 0, backoff: 1, maxDelay: 0 }, /attempts/],
+    [{ attempts: 1.5, initialDelay: 0, backoff: 1, maxDelay: 0 }, /attempts/],
+    [{ attempts: '3', initialDelay: 0, backoff: 1, maxDelay: 0 }, /attempts/],
+    [{ attempts: 1, initialDelay: -1, backoff: 1, maxDelay: 0 }, /initialDelay/],
+    [{ attempts: 1, initialDelay: 60001, backoff: 1, maxDelay: 60001 }, /initialDelay/],
+    [{ attempts: 1, initialDelay: 0, backoff: 0.5, maxDelay: 0 }, /backoff/],
+    [{ attempts: 1, initialDelay: 0, backoff: 5, maxDelay: 0 }, /backoff/],
+    [{ attempts: 1, initialDelay: 0, backoff: Infinity, maxDelay: 0 }, /backoff/],
+    [{ attempts: 1, initialDelay: 100, backoff: 1, maxDelay: 50 }, /maxDelay must not be less than initialDelay/],
+    [{ attempts: 1, initialDelay: 0, backoff: 1 }, /maxDelay is required/],
+    [null, /retry must be an object/],
+  ];
+  for (const [retry, matcher] of cases) {
+    await assert.rejects(
+      () => executeWorkflowAsync(businessWorkflow('op', { retry }), {}, { op: () => ({}) }),
+      matcher
+    );
+  }
+});
+
+test('a successful business action activates successors and satisfies a shared join once', async () => {
+  const calls = [];
+  const workflow = {
+    id: 'join', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', operation: 'opA', next: 'join' },
+      { id: 'b', type: 'action', operation: 'opB', next: 'join' },
+      { id: 'join', type: 'action', dependsOn: ['a', 'b'], next: 'done' },
+      { id: 'done', type: 'end', result: 'finished' },
+    ],
+  };
+  const operations = {
+    opA: () => { calls.push('a'); return { a: 1 }; },
+    opB: () => { calls.push('b'); return { b: 2 }; },
+  };
+  const execution = await executeWorkflowAsync(workflow, {}, operations);
+  assert.equal(execution.status, 'completed');
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'a', 'b', 'join', 'done']);
+  assert.deepEqual(execution.context.output, { a: { a: 1 }, b: { b: 2 }, join: 'action:join' });
+  assert.deepEqual(calls, ['a', 'b']);
+});
+
+test('form failures, condition failures and blocking keep their results in async mode', async () => {
+  const formWorkflowDef = {
+    id: 'formfail', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'collect' },
+      { id: 'collect', type: 'form', next: 'done', schema: { fields: [{ path: 'a', type: 'string', required: true }] } },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  };
+  const formExecution = await executeWorkflowAsync(formWorkflowDef, {}, {});
+  assert.equal(formExecution.status, 'invalid_input');
+  assert.deepEqual(formExecution.errors, [{ nodeId: 'collect', path: 'a', code: 'required' }]);
+  assert.deepEqual(formExecution.attemptRecords, []);
+
+  const conditionWorkflowDef = {
+    id: 'condfail', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'check' },
+      { id: 'check', type: 'condition', condition: { field: 'x', operator: 'gte', value: 0 }, then: 'done', else: 'done' },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  };
+  const conditionExecution = await executeWorkflowAsync(conditionWorkflowDef, { x: 'abc' }, {});
+  assert.equal(conditionExecution.status, 'invalid_condition');
+  assert.deepEqual(conditionExecution.attemptRecords, []);
+
+  const blockedWorkflowDef = {
+    id: 'blocked', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'check' },
+      { id: 'check', type: 'condition', condition: { field: 'vip', operator: 'eq', value: true }, then: 'priority', else: 'standard' },
+      { id: 'priority', type: 'action', operation: 'op', next: 'wrap' },
+      { id: 'standard', type: 'action', next: 'wrap' },
+      { id: 'wrap', type: 'action', dependsOn: ['standard', 'priority'], next: 'done' },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  };
+  const blockedExecution = await executeWorkflowAsync(blockedWorkflowDef, { vip: true }, { op: () => ({ done: true }) });
+  assert.equal(blockedExecution.status, 'blocked');
+  assert.deepEqual(blockedExecution.blockedNodes, [{ nodeId: 'wrap', missingDependencies: ['standard'] }]);
+  assert.deepEqual(blockedExecution.trace.map(n => n.nodeId), ['start', 'check', 'priority']);
+  assert.deepEqual(blockedExecution.attemptRecords, [{ nodeId: 'priority', attempt: 1, ok: true, error: null, waitMs: 0 }]);
+});
+
+test('async runs never mutate the definition or caller input and stay independent', async () => {
+  const workflow = businessWorkflow('greet', { retry: { attempts: 2, initialDelay: 1, backoff: 1, maxDelay: 1 } });
+  const definitionSnapshot = JSON.stringify(workflow);
+  const caller = { name: 'Ada' };
+  const inputSnapshot = JSON.stringify(caller);
+  let attempt = 0;
+  const operations = {
+    greet: input => {
+      attempt += 1;
+      if (attempt === 1) throw new Error('retry');
+      return { echoed: input.name };
+    },
+  };
+  const first = await executeWorkflowAsync(workflow, caller, operations);
+  const second = await executeWorkflowAsync(workflow, { name: 'Grace' }, operations);
+  assert.equal(first.status, 'completed');
+  assert.equal(second.status, 'completed');
+  assert.deepEqual(caller, { name: 'Ada' });
+  assert.equal(JSON.stringify(workflow), definitionSnapshot);
+  assert.equal(JSON.stringify(caller), inputSnapshot);
+  assert.deepEqual(first.context.output.do, { echoed: 'Ada' });
+  assert.deepEqual(second.context.output.do, { echoed: 'Grace' });
 });
 

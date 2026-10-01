@@ -247,6 +247,46 @@ function compileCondition(condition, nodeId, position = '$', depth = 1) {
   return compiled;
 }
 
+// Business actions may declare a `retry` group with all four fields. The
+// group is optional: omitting it means a single attempt. When present every
+// field is required and must satisfy the bounds below; `maxDelay` must not be
+// smaller than `initialDelay`.
+function validateRetryConfig(retry, nodeId) {
+  const label = `action node ${nodeId}: retry`;
+  if (!isUsableObject(retry)) throw new Error(`${label} must be an object`);
+  for (const field of ['attempts', 'initialDelay', 'backoff', 'maxDelay']) {
+    if (!Object.hasOwn(retry, field)) throw new Error(`${label}.${field} is required`);
+  }
+  const { attempts, initialDelay, backoff, maxDelay } = retry;
+  if (!Number.isInteger(attempts) || attempts < 1 || attempts > 10) {
+    throw new Error(`${label}.attempts must be an integer between 1 and 10`);
+  }
+  for (const field of ['initialDelay', 'maxDelay']) {
+    const value = retry[field];
+    if (!Number.isInteger(value) || value < 0 || value > 60000) {
+      throw new Error(`${label}.${field} must be an integer between 0 and 60000`);
+    }
+  }
+  if (typeof backoff !== 'number' || !Number.isFinite(backoff) || backoff < 1 || backoff > 4) {
+    throw new Error(`${label}.backoff must be a finite number between 1 and 4`);
+  }
+  if (maxDelay < initialDelay) {
+    throw new Error(`${label}.maxDelay must not be less than initialDelay`);
+  }
+}
+
+// Definition-level checks for action nodes. An `operation` name must be a
+// non-whitespace string; the implementation itself is only known to the async
+// entry point and is checked there. A `retry` group is validated here so that
+// malformed definitions are rejected before any node runs.
+function validateActionDefinition(node) {
+  if (!Object.hasOwn(node, 'operation')) return;
+  if (typeof node.operation !== 'string' || !node.operation.trim()) {
+    throw new Error(`action node ${node.id}: operation name must be a non-empty string`);
+  }
+  if (Object.hasOwn(node, 'retry')) validateRetryConfig(node.retry, node.id);
+}
+
 const formSchemas = new WeakMap();
 const compiledConditions = new WeakMap();
 const successorTargets = new WeakMap();
@@ -384,6 +424,9 @@ export function validateWorkflow(workflow) {
     if (node.type === 'condition') {
       compiledConditions.set(node, compileCondition(node.condition, node.id));
     }
+    if (node.type === 'action') {
+      validateActionDefinition(node);
+    }
   }
 
   if (requiresSingleEnd) {
@@ -517,6 +560,13 @@ function processForm(node, input, compiled) {
 
 export function executeWorkflow(workflow, input = {}) {
   const nodes = validateWorkflow(workflow);
+  // Business actions require the async entry point; reject before any node
+  // runs, naming the node and the reason.
+  for (const node of nodes.values()) {
+    if (node.type === 'action' && Object.hasOwn(node, 'operation')) {
+      throw new Error(`action node ${node.id} specifies a business operation, which requires executeWorkflowAsync`);
+    }
+  }
   const trace = [];
   const context = { input: structuredClone(input), output: {} };
   const declarationOrder = [...nodes.values()];
@@ -574,6 +624,155 @@ export function executeWorkflow(workflow, input = {}) {
       const outcome = runCondition(compiledConditions.get(ready), context.input, ready.id);
       if (!outcome.ok) {
         return { status: 'invalid_condition', context, trace, error: outcome.error };
+      }
+      activated.add(outcome.value ? ready.then : ready.else);
+    } else {
+      for (const target of successorTargets.get(ready)) activated.add(target);
+    }
+    completed.add(ready.id);
+  }
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Computed wait before the next attempt: initial delay grows by the backoff
+// factor per failed attempt (attempt 1 -> initialDelay) and is capped.
+function computeRetryWait(retry, attempt) {
+  const grown = retry.initialDelay * (retry.backoff ** (attempt - 1));
+  return Math.min(grown, retry.maxDelay);
+}
+
+// Runs one business action through its attempts. Each attempt receives fresh
+// structural clones of the run input and of the successful outputs so far; a
+// failed attempt's mutations never reach the next attempt or the run context.
+// The resolved return value is cloned before it is stored, so the operation
+// keeps its own copy and the run keeps an independent one. A throw, a
+// rejected promise, or a return value that cannot be structurally cloned all
+// count as this attempt's failure.
+async function runBusinessAction(node, context, operations, attemptRecords) {
+  const retry = node.retry ?? { attempts: 1, initialDelay: 0, backoff: 1, maxDelay: 0 };
+  const totalAttempts = retry.attempts;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+    const inputCopy = structuredClone(context.input);
+    const outputCopy = structuredClone(context.output);
+    let returnValue;
+    let attemptError = null;
+    try {
+      returnValue = await operations[node.operation](inputCopy, outputCopy, node.id, attempt);
+    } catch (error) {
+      attemptError = error;
+    }
+    if (attemptError === null) {
+      try {
+        const cloned = structuredClone(returnValue);
+        attemptRecords.push({ nodeId: node.id, attempt, ok: true, error: null, waitMs: 0 });
+        return { ok: true, value: cloned };
+      } catch (error) {
+        attemptError = error;
+      }
+    }
+    lastError = attemptError;
+    const waitMs = attempt < totalAttempts ? computeRetryWait(retry, attempt) : 0;
+    attemptRecords.push({ nodeId: node.id, attempt, ok: false, error: attemptError, waitMs });
+    if (attempt < totalAttempts) await sleep(waitMs);
+  }
+  return { ok: false, error: lastError };
+}
+
+// Async entry point. `operations` maps operation names to implementations. A
+// business action waits for the implementation's returned value or promise,
+// retrying per its `retry` group; only after success does it activate
+// successors. Nodes still run one at a time in declaration order, and the
+// original trace still records each actually-executed node exactly once.
+export async function executeWorkflowAsync(workflow, input = {}, operations = {}) {
+  const nodes = validateWorkflow(workflow);
+
+  // Every business action — including untaken branches and unreachable nodes
+  // — must name an implemented operation before any node runs.
+  for (const node of nodes.values()) {
+    if (node.type !== 'action' || !Object.hasOwn(node, 'operation')) continue;
+    const name = node.operation;
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new Error(`action node ${node.id}: operation name must be a non-empty string`);
+    }
+    if (typeof operations[name] !== 'function') {
+      throw new Error(`action node ${node.id}: operation ${name} is not implemented`);
+    }
+  }
+
+  const trace = [];
+  const attemptRecords = [];
+  const context = { input: structuredClone(input), output: {} };
+  const declarationOrder = [...nodes.values()];
+  const declarationIndex = new Map(declarationOrder.map((node, index) => [node.id, index]));
+
+  const activated = new Set([workflow.entry]);
+  const completed = new Set();
+  let endReached = false;
+  let endResult = null;
+
+  for (;;) {
+    const ready = declarationOrder.find(node =>
+      activated.has(node.id) && !completed.has(node.id)
+      && nodeDependencies.get(node).every(dependency => completed.has(dependency)));
+
+    if (!ready) {
+      const waiting = declarationOrder.filter(node => activated.has(node.id) && !completed.has(node.id));
+      if (waiting.length > 0) {
+        const blockedNodes = waiting.map(node => ({
+          nodeId: node.id,
+          missingDependencies: nodeDependencies.get(node)
+            .filter(dependency => !completed.has(dependency))
+            .sort((a, b) => declarationIndex.get(a) - declarationIndex.get(b)),
+        }));
+        return { status: 'blocked', context, trace, blockedNodes, attemptRecords };
+      }
+      if (endReached) return { status: 'completed', result: endResult, context, trace, attemptRecords };
+      throw new Error('workflow did not terminate; a cycle is present');
+    }
+
+    trace.push({ nodeId: ready.id, type: ready.type });
+    if (ready.type === 'end') {
+      endReached = true;
+      endResult = ready.result ?? null;
+      completed.add(ready.id);
+      continue;
+    }
+    if (ready.type === 'action') {
+      if (Object.hasOwn(ready, 'operation')) {
+        const result = await runBusinessAction(ready, context, operations, attemptRecords);
+        if (!result.ok) {
+          return {
+            status: 'action_failed',
+            nodeId: ready.id,
+            attempts: ready.retry?.attempts ?? 1,
+            error: result.error,
+            context,
+            trace,
+            attemptRecords,
+          };
+        }
+        context.output[ready.id] = result.value;
+      } else {
+        context.output[ready.id] = ready.message ?? `action:${ready.id}`;
+      }
+    }
+    if (ready.type === 'form') {
+      const compiled = formSchemas.get(ready);
+      if (compiled) {
+        const formResult = processForm(ready, context.input, compiled);
+        if (!formResult.ok) {
+          context.input = formResult.rollback;
+          return { status: 'invalid_input', context, trace, errors: formResult.errors, attemptRecords };
+        }
+      }
+    }
+    if (ready.type === 'condition') {
+      const outcome = runCondition(compiledConditions.get(ready), context.input, ready.id);
+      if (!outcome.ok) {
+        return { status: 'invalid_condition', context, trace, error: outcome.error, attemptRecords };
       }
       activated.add(outcome.value ? ready.then : ready.else);
     } else {
