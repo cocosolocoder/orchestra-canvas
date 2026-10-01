@@ -141,3 +141,35 @@ Nodes still execute one at a time in declaration order: while an action waits or
 
 Earlier input and successful outputs are preserved, the failed node has no output, no later node runs, and reaching an `end` node earlier does not make the run `completed`. Every result from `executeWorkflowAsync` also carries `actionAttempts`: records in invocation order, each `{ nodeId, attempt, ok, error, nextDelayMs }`, where `nextDelayMs` is the wait before the next attempt or `0` when none follows. The regular `trace` still lists each actually executed node exactly once. Form failures (`invalid_input`), condition failures (`invalid_condition`) and dependency blocking (`blocked`) keep their existing result shapes.
 
+## Compensation
+
+A business action may declare a `compensation` to undo its successful work when the run terminates early:
+
+```json
+{
+  "id": "charge-card",
+  "type": "action",
+  "operation": "charge",
+  "compensation": { "operation": "refund", "retry": { "attempts": 3, "initialDelayMs": 10, "backoffFactor": 2, "maxDelayMs": 100 } },
+  "next": "done"
+}
+```
+
+`compensation` names an `operation` (a non-blank string, resolved from the operations map passed to `executeWorkflowAsync`) and an optional `retry` block with the same four fields and ranges as a business action's retry. Without `retry`, a compensation is attempted exactly once. Compensation is only allowed on actions that name a business operation; legacy message actions cannot declare one.
+
+When the run stops because a business action exhausts its retries, a form fails validation, a condition evaluation fails, or activated nodes are left blocked on dependencies, no further normal nodes execute. Instead, every successful business action that declared a compensation is compensated, one at a time, in reverse order of actual success. Only successful actions participate: a failed action, a legacy message action, and an untaken branch are never compensated. An action that succeeded after retries and a shared join node are each compensated exactly once. Reaching an `end` node before the failure does not skip compensation; a `completed` run never calls compensation.
+
+A compensation is called as `compensation(input, output, result, nodeId, attempt)`:
+
+- `input` — an independent structured clone of the run's input at the time the original action succeeded.
+- `output` — an independent structured clone of the outputs of nodes that had succeeded before the original action (the action's own output is not included).
+- `result` — an independent structured clone of the original action's return value.
+- `nodeId` — the original action's id; `attempt` starts at `1` for each compensated action.
+
+The copies are independent: later form defaults and mutations by a compensation attempt cannot touch the stored records, the next attempt, or other runs, and the stored compensation success value is unaffected by later mutation of an object the implementation keeps holding. A thrown exception, a rejected Promise, or a return value that cannot be structured-cloned all count as a failed compensation attempt. Compensation uses its own retry count and waits; after the final attempt it is recorded as failed and the run continues with earlier actions — the original business operation is never re-executed.
+
+Every result from `executeWorkflowAsync` carries `compensationStatus` and `compensationAttempts`. `compensationStatus` is `not_needed` when no compensation was configured, `completed` when every configured compensation succeeded, and `failed` when any compensation ultimately failed. `compensationAttempts` lists every compensation attempt in actual call order, each `{ nodeId, operation, attempt, ok, error, nextDelayMs, value }` (with `value` the cloned success return value, or `null` on failure). The original status, failure details, context, trace and `actionAttempts` are preserved, successful outputs are never deleted or overwritten, and compensation records never mix into the regular `trace`.
+
+Before the run starts — covering untaken branches and entry-unreachable nodes — every compensation name and retry config is validated (the config must be an object with a non-blank operation name and legal retry settings), and every named compensation operation must exist in `operations` as a function. Any violation throws with the node id and reason before the first node executes, without invoking an operation even once.
+
+
