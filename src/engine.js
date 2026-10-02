@@ -254,15 +254,51 @@ const nodeDependencies = new WeakMap();
 const actionBindings = new WeakMap();
 
 const RETRY_FIELDS = ['attempts', 'initialDelayMs', 'backoffFactor', 'maxDelayMs'];
+const DEFAULT_RETRY = { attempts: 1, initialDelayMs: 0, backoffFactor: 1, maxDelayMs: 0 };
 
 function isIntegerIn(value, min, max) {
   return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
 }
 
-// An action node either keeps the legacy `message` behavior or names a
-// business operation the caller supplies at run time. The retry block is
-// either absent (one attempt, no waiting) or present with all four
-// parameters together.
+// A retry block is either absent (one attempt, no waiting) or present with all
+// four parameters together, each within the same ranges the engine enforces
+// for business action retries and compensation retries alike.
+function compileRetry(config, label) {
+  if (!isUsableObject(config)) {
+    throw new Error(`${label}: retry must be an object`);
+  }
+  const missing = RETRY_FIELDS.filter(field => !Object.hasOwn(config, field) || config[field] === undefined);
+  if (missing.length > 0) {
+    throw new Error(`${label}: retry config must define all of ${RETRY_FIELDS.join(', ')} together (missing: ${missing.join(', ')})`);
+  }
+  if (!isIntegerIn(config.attempts, 1, 10)) {
+    throw new Error(`${label}: retry.attempts must be an integer between 1 and 10`);
+  }
+  if (!isIntegerIn(config.initialDelayMs, 0, 60000)) {
+    throw new Error(`${label}: retry.initialDelayMs must be an integer between 0 and 60000 milliseconds`);
+  }
+  if (!isIntegerIn(config.maxDelayMs, 0, 60000)) {
+    throw new Error(`${label}: retry.maxDelayMs must be an integer between 0 and 60000 milliseconds`);
+  }
+  if (typeof config.backoffFactor !== 'number' || !Number.isFinite(config.backoffFactor)
+    || config.backoffFactor < 1 || config.backoffFactor > 4) {
+    throw new Error(`${label}: retry.backoffFactor must be a finite number between 1 and 4`);
+  }
+  if (config.maxDelayMs < config.initialDelayMs) {
+    throw new Error(`${label}: retry.maxDelayMs must not be less than retry.initialDelayMs`);
+  }
+  return {
+    attempts: config.attempts,
+    initialDelayMs: config.initialDelayMs,
+    backoffFactor: config.backoffFactor,
+    maxDelayMs: config.maxDelayMs,
+  };
+}
+
+// An action node either keeps the legacy `message` behavior, names a business
+// operation the caller supplies at run time, and/or declares a compensation
+// operation that undoes its business effect. Both retry blocks are optional
+// and, absent, mean exactly one attempt with no waiting.
 function compileAction(node) {
   let name = null;
   if (Object.hasOwn(node, 'operation') && node.operation !== undefined) {
@@ -272,42 +308,34 @@ function compileAction(node) {
     name = node.operation;
   }
 
-  const retry = { attempts: 1, initialDelayMs: 0, backoffFactor: 1, maxDelayMs: 0 };
+  let retry = { ...DEFAULT_RETRY };
   if (Object.hasOwn(node, 'retry') && node.retry !== undefined) {
     if (!name) {
       throw new Error(`action node ${node.id}: retry config is only allowed on an action that names an operation`);
     }
-    const config = node.retry;
-    if (!isUsableObject(config)) {
-      throw new Error(`action node ${node.id}: retry must be an object`);
-    }
-    const missing = RETRY_FIELDS.filter(field => !Object.hasOwn(config, field) || config[field] === undefined);
-    if (missing.length > 0) {
-      throw new Error(`action node ${node.id}: retry config must define all of ${RETRY_FIELDS.join(', ')} together (missing: ${missing.join(', ')})`);
-    }
-    if (!isIntegerIn(config.attempts, 1, 10)) {
-      throw new Error(`action node ${node.id}: retry.attempts must be an integer between 1 and 10`);
-    }
-    if (!isIntegerIn(config.initialDelayMs, 0, 60000)) {
-      throw new Error(`action node ${node.id}: retry.initialDelayMs must be an integer between 0 and 60000 milliseconds`);
-    }
-    if (!isIntegerIn(config.maxDelayMs, 0, 60000)) {
-      throw new Error(`action node ${node.id}: retry.maxDelayMs must be an integer between 0 and 60000 milliseconds`);
-    }
-    if (typeof config.backoffFactor !== 'number' || !Number.isFinite(config.backoffFactor)
-      || config.backoffFactor < 1 || config.backoffFactor > 4) {
-      throw new Error(`action node ${node.id}: retry.backoffFactor must be a finite number between 1 and 4`);
-    }
-    if (config.maxDelayMs < config.initialDelayMs) {
-      throw new Error(`action node ${node.id}: retry.maxDelayMs must not be less than retry.initialDelayMs`);
-    }
-    retry.attempts = config.attempts;
-    retry.initialDelayMs = config.initialDelayMs;
-    retry.backoffFactor = config.backoffFactor;
-    retry.maxDelayMs = config.maxDelayMs;
+    retry = compileRetry(node.retry, `action node ${node.id}`);
   }
 
-  return { name, retry };
+  let compensation = null;
+  if (Object.hasOwn(node, 'compensation') && node.compensation !== undefined) {
+    if (!isUsableObject(node.compensation)) {
+      throw new Error(`action node ${node.id}: compensation must be an object`);
+    }
+    if (!name) {
+      throw new Error(`action node ${node.id}: compensation is only allowed on an action that names an operation`);
+    }
+    const config = node.compensation;
+    if (typeof config.operation !== 'string' || config.operation.trim().length === 0) {
+      throw new Error(`action node ${node.id}: compensation.operation must be a non-empty string name`);
+    }
+    let compRetry = { ...DEFAULT_RETRY };
+    if (Object.hasOwn(config, 'retry') && config.retry !== undefined) {
+      compRetry = compileRetry(config.retry, `action node ${node.id} compensation`);
+    }
+    compensation = { name: config.operation, retry: compRetry };
+  }
+
+  return { name, retry, compensation };
 }
 
 // Resolves the outgoing edges of a node. Trigger, form and action nodes may
@@ -436,6 +464,9 @@ export function validateWorkflow(workflow) {
     nodeDependencies.set(node, dependencies);
     const usesArraySuccessors = node.type !== 'end' && node.type !== 'condition' && Array.isArray(node.next);
     if (usesArraySuccessors || dependencies.length > 0) requiresSingleEnd = true;
+    if (Object.hasOwn(node, 'compensation') && node.compensation !== undefined && node.type !== 'action') {
+      throw new Error(`node ${node.id}: compensation is only allowed on a business action node`);
+    }
     if (node.type === 'form') {
       formSchemas.set(node, compileFormSchema(node));
     }
@@ -638,6 +669,74 @@ async function runBusinessAction(node, binding, implementation, context, actionA
   return { ok: false, error: lastReason };
 }
 
+// Runs compensation for one already-succeeded business action. The call gets
+// independent structured clones of the input and earlier outputs captured at
+// the original action's success moment, the stored return value, the node id
+// and a 1-based compensation attempt number. Nothing here can touch the run
+// context, a later attempt, another run, or the stored success output.
+async function runCompensation(entry, implementation, records) {
+  const { nodeId, binding, snapshot } = entry;
+  const { retry } = binding.compensation;
+  let lastReason = null;
+
+  for (let attempt = 1; attempt <= retry.attempts; attempt += 1) {
+    const inputCopy = structuredClone(snapshot.input);
+    const outputCopy = structuredClone(snapshot.output);
+    const resultCopy = structuredClone(snapshot.result);
+    const record = {
+      nodeId, operation: binding.compensation.name, attempt,
+      ok: false, error: null, nextDelayMs: 0, result: null,
+    };
+    let returned;
+    try {
+      returned = await implementation(inputCopy, outputCopy, resultCopy, nodeId, attempt);
+    } catch (error) {
+      lastReason = describeError(error);
+      record.error = lastReason;
+    }
+
+    if (record.error === null) {
+      try {
+        returned = structuredClone(returned);
+      } catch (error) {
+        lastReason = `compensation "${binding.compensation.name}" returned a value that cannot be structured-cloned`;
+        record.error = lastReason;
+      }
+    }
+
+    if (record.error === null) {
+      record.ok = true;
+      record.result = returned;
+      records.push(record);
+      return { ok: true, value: returned };
+    }
+
+    record.nextDelayMs = attempt < retry.attempts ? retryDelay(retry, attempt) : 0;
+    records.push(record);
+    if (record.nextDelayMs > 0) await sleep(record.nextDelayMs);
+  }
+
+  return { ok: false, error: lastReason };
+}
+
+// Undoes successful compensable business actions, most recent first, waiting
+// for each compensation to finish before starting the next. A compensation
+// that exhausts its retries is recorded as failed but earlier (still-pending)
+// actions are compensated regardless; neither the failed compensation nor the
+// original business operation is re-run. Compensating a node removes it from
+// the pending list exactly once — retried-then-succeeded actions and shared
+// join nodes were only recorded once to begin with.
+async function compensateRun(state, operations) {
+  const records = [];
+  let failed = false;
+  while (state.compensable.length > 0) {
+    const entry = state.compensable.pop();
+    const outcome = await runCompensation(entry, operations[entry.binding.compensation.name], records);
+    if (!outcome.ok) failed = true;
+  }
+  return { status: failed ? 'failed' : 'completed', attempts: records };
+}
+
 // Scheduling state shared by the synchronous and asynchronous execution
 // loops: activation, completion, dependency gating and the recorded end
 // result all behave identically; only business-action handling differs.
@@ -654,6 +753,10 @@ function createRunState(nodes, workflow, input) {
     completed: new Set(),
     endReached: false,
     endResult: null,
+    // Successful business actions that declared a compensation, in the order
+    // they succeeded. Each entry keeps independent snapshots captured at the
+    // action's own success moment.
+    compensable: [],
   };
 }
 
@@ -705,18 +808,26 @@ function applyRegularNode(node, state) {
   return null;
 }
 
-// Verifies, before a single node can run, that every business action in the
-// definition has a function registered — including actions on untaken
-// branches and entry-unreachable nodes.
+// Verifies, before a single node can run, that every business operation and
+// every compensation operation in the definition has a function registered —
+// including actions on untaken branches and entry-unreachable nodes.
+function resolveImplementation(operations, name, nodeId, kind) {
+  if (!isUsableObject(operations)
+    || !Object.hasOwn(operations, name)
+    || typeof operations[name] !== 'function') {
+    throw new Error(`action node ${nodeId}: ${kind} operation "${name}" has no function implementation; pass it to executeWorkflowAsync`);
+  }
+  return operations[name];
+}
+
 function verifyOperations(nodes, operations) {
   for (const node of nodes.values()) {
     const binding = actionBindings.get(node);
     if (binding && binding.name !== null) {
-      if (!isUsableObject(operations)
-        || !Object.hasOwn(operations, binding.name)
-        || typeof operations[binding.name] !== 'function') {
-        throw new Error(`action node ${node.id}: operation "${binding.name}" has no function implementation; pass it to executeWorkflowAsync`);
-      }
+      resolveImplementation(operations, binding.name, node.id, 'business');
+    }
+    if (binding && binding.compensation !== null) {
+      resolveImplementation(operations, binding.compensation.name, node.id, 'compensation');
     }
   }
 }
@@ -763,6 +874,16 @@ export function executeWorkflow(workflow, input = {}) {
   }
 }
 
+// Attaches compensation results to a failed run. Successful outputs and the
+// original terminal status stay untouched; compensation records live on
+// their own fields, never in the regular node trace.
+async function withCompensation(result, state, operations) {
+  const outcome = await compensateRun(state, operations);
+  result.compensationStatus = outcome.attempts.length === 0 ? 'not_needed' : outcome.status;
+  result.compensationAttempts = outcome.attempts;
+  return result;
+}
+
 export async function executeWorkflowAsync(workflow, input = {}, operations = {}) {
   const nodes = validateWorkflow(workflow);
   verifyOperations(nodes, operations);
@@ -775,15 +896,19 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
     if (!ready) {
       const blockedNodes = blockedResult(state);
       if (blockedNodes) {
-        return {
+        // Unmet dependencies end the run; successful compensable actions are
+        // rolled back even though an end node may already have been reached.
+        return withCompensation({
           status: 'blocked', context: state.context, trace: state.trace,
           blockedNodes, actionAttempts: state.actionAttempts,
-        };
+        }, state, operations);
       }
       if (state.endReached) {
+        // A completed run never invokes compensation.
         return {
           status: 'completed', result: state.endResult, context: state.context,
           trace: state.trace, actionAttempts: state.actionAttempts,
+          compensationStatus: 'not_needed', compensationAttempts: [],
         };
       }
       throw new Error('workflow did not terminate; a cycle is present');
@@ -807,14 +932,29 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
         if (!actionResult.ok) {
           // Retries are exhausted: stop immediately with prior input/output
           // preserved, no output for this node and no successors activated —
-          // even if an end node was already reached.
-          return {
+          // even if an end node was already reached — then compensate every
+          // earlier successful action that asked for it.
+          return withCompensation({
             status: 'action_failed', nodeId: ready.id, attempts: binding.retry.attempts,
             error: actionResult.error, context: state.context, trace: state.trace,
             actionAttempts: state.actionAttempts,
-          };
+          }, state, operations);
         }
+        // Capture the compensation snapshots from the state before the new
+        // output key lands: the action's own return value is handed to the
+        // compensation separately as its third argument.
+        const compensationSnapshot = binding.compensation === null ? null : {
+          input: structuredClone(state.context.input),
+          output: structuredClone(state.context.output),
+          result: structuredClone(actionResult.value),
+        };
         state.context.output[ready.id] = actionResult.value;
+        if (compensationSnapshot) {
+          // Each node completes at most once, so retried-then-successful
+          // actions and shared join nodes are scheduled for compensation
+          // exactly once.
+          state.compensable.push({ nodeId: ready.id, binding, snapshot: compensationSnapshot });
+        }
         for (const target of successorTargets.get(ready)) state.activated.add(target);
         state.completed.add(ready.id);
         continue;
@@ -824,7 +964,10 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
     const early = applyRegularNode(ready, state);
     if (early) {
       early.actionAttempts = state.actionAttempts;
-      return early;
+      // A failed form (invalid_input) or failed condition evaluation
+      // (invalid_condition) ends normal execution and triggers compensation
+      // of the successful business actions that ran earlier.
+      return withCompensation(early, state, operations);
     }
   }
 }
