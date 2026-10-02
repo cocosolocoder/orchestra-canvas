@@ -104,7 +104,7 @@ const result = await executeWorkflowAsync(workflow, input, {
 });
 ```
 
-`executeWorkflowAsync(workflow, input?, operations?)` is the asynchronous entry point. Legacy message actions, forms, conditions, branching, dependencies and join semantics work exactly as in `executeWorkflow`; that synchronous entry, `validateWorkflow`, and the command-line demo continue to work unchanged. If a validated workflow names any business operation, `executeWorkflow` rejects before the first node executes, naming the node and explaining that the workflow must run through `executeWorkflowAsync`.
+`executeWorkflowAsync(workflow, input?, operations?, options?)` is the asynchronous entry point. Legacy message actions, forms, conditions, branching, dependencies and join semantics work exactly as in `executeWorkflow`; that synchronous entry, `validateWorkflow`, and the command-line demo continue to work unchanged. If a validated workflow names any business operation, `executeWorkflow` rejects before the first node executes, naming the node and explaining that the workflow must run through `executeWorkflowAsync`.
 
 An implementation is called as `operation(input, output, nodeId, attempt)`:
 
@@ -180,5 +180,41 @@ Every `executeWorkflowAsync` result also carries:
 The original terminal status, failure details, `context`, regular `trace`, and `actionAttempts` are preserved unchanged; compensation records never appear in the normal node trace.
 
 `validateWorkflow` rejects a `compensation` that is not an object, compensation declared on anything but a business action (including legacy message actions), a missing, non-string or blank operation name, and an illegal compensation retry block. Before the first node executes, `executeWorkflowAsync` additionally confirms that every declared compensation name — including actions on untaken branches and entry-unreachable nodes — has a function implementation. Any configuration problem throws naming the node and reason without invoking a single operation. The synchronous `executeWorkflow` and the command-line demo keep their existing behavior; workflows without compensation follow the previous execution rules exactly.
+
+## Cancellation
+
+An asynchronous run can be cancelled through an `AbortSignal` passed as the optional fourth argument:
+
+```js
+const controller = new AbortController();
+const run = executeWorkflowAsync(workflow, input, operations, { signal: controller.signal });
+controller.abort(); // at any later moment
+const result = await run;
+```
+
+Omitting the options argument, passing `undefined`, or passing an object without a `signal` keeps the existing behavior; anything else — a non-object options value, or a `signal` that is not an `AbortSignal` — throws before any node executes. The signal only affects the run it was passed to; other runs of the same workflow are untouched.
+
+Once the signal fires, no new regular node executes and no new business-action attempt starts — not even with a zero retry delay. The run eventually returns:
+
+```json
+{
+  "status": "cancelled",
+  "context": { "input": {}, "output": {} },
+  "trace": [ ... ],
+  "actionAttempts": [ ... ],
+  "compensationStatus": "completed",
+  "compensationAttempts": [ ... ]
+}
+```
+
+The result carries the `context`, `trace`, `actionAttempts`, `compensationStatus` and `compensationAttempts` as they stand at that moment, and never a success `result`. In detail:
+
+- **Already aborted at start** — the definition and the business/compensation operation registration checks still run first and report problems as usual. If they pass, the run returns `cancelled` with an empty trace and empty attempt records, an independent copy of the input, and `compensationStatus: "not_needed"`, without invoking any business or compensation operation.
+- **During a retry wait** — the wait ends immediately and no further attempt is made. The failed attempt's record keeps its error, and its `nextDelayMs` becomes `0`.
+- **While an operation is in flight** — the running call is awaited, never interrupted, and its arguments are unchanged. A success (with a structured-cloneable value) stores the output, records the success and is scheduled for compensation; a throw, rejection or uncloneable return keeps the failure record, stores no output and is not retried. If the signal had fired before that outcome was processed, the run ends `cancelled` — even when the failure was the last allowed attempt.
+- **Compensation after cancellation** follows the usual rules: successful actions that declared a compensation are undone in reverse success order with their success-moment snapshots and compensation retry configs, a failed compensation never stops earlier ones, and the result returns only after all of them finish. Further cancellation during compensation neither interrupts it nor causes duplicate calls, and successful outputs are never deleted. With nothing to compensate, `compensationStatus` is `not_needed`.
+- A run that already visited `end` but still has unfinished activated branches can still be cancelled. A cancellation that arrives only after the terminal state was determined — including while a failure's compensation is still running — never rewrites that result.
+
+The synchronous `executeWorkflow`, the command-line demo and uncancelled runs behave exactly as before.
 
 

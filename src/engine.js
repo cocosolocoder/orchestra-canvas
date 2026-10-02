@@ -608,9 +608,23 @@ function processForm(node, input, compiled) {
 }
 
 // Wait before a retry. Timers are the only suspension point: no other node is
-// ever scheduled while an action waits.
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+// ever scheduled while an action waits. When a cancellation signal is given,
+// an abort ends the wait immediately and the promise resolves to true; a
+// wait that runs its full course resolves to false.
+function sleep(ms, signal) {
+  return new Promise(resolve => {
+    const finish = cancelled => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve(cancelled);
+    };
+    const onAbort = () => finish(true);
+    const timer = setTimeout(() => finish(false), ms);
+    if (signal) {
+      if (signal.aborted) finish(true);
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
 }
 
 function describeError(error) {
@@ -630,11 +644,17 @@ function retryDelay(retry, failedAttempt) {
 // structured clones of the current input and the successful outputs so far;
 // mutations by a failed attempt are discarded, and the stored success value
 // is a clone independent of any object the implementation keeps holding.
-async function runBusinessAction(node, binding, implementation, context, actionAttempts) {
+// When a cancellation signal is given, no new attempt starts once it has
+// fired — even with a zero retry delay — and a wait in progress ends early;
+// an attempt already running is always awaited and its outcome recorded.
+async function runBusinessAction(node, binding, implementation, context, actionAttempts, signal) {
   const { retry } = binding;
   let lastReason = null;
 
   for (let attempt = 1; attempt <= retry.attempts; attempt += 1) {
+    if (signal && signal.aborted) {
+      return { ok: false, cancelled: true, error: lastReason };
+    }
     const inputCopy = structuredClone(context.input);
     const outputCopy = structuredClone(context.output);
     const record = { nodeId: node.id, attempt, ok: false, error: null, nextDelayMs: 0 };
@@ -661,9 +681,25 @@ async function runBusinessAction(node, binding, implementation, context, actionA
       return { ok: true, value: returned };
     }
 
+    // A cancellation observed while the attempt was in flight keeps the
+    // failure record but stops the retry loop: no wait, no next attempt —
+    // even when this was the last attempt the run could have made.
+    if (signal && signal.aborted) {
+      actionAttempts.push(record);
+      return { ok: false, cancelled: true, error: lastReason };
+    }
+
     record.nextDelayMs = attempt < retry.attempts ? retryDelay(retry, attempt) : 0;
     actionAttempts.push(record);
-    if (record.nextDelayMs > 0) await sleep(record.nextDelayMs);
+    if (record.nextDelayMs > 0) {
+      // A cancellation during the wait ends it immediately; the failed
+      // attempt's record keeps its error but no longer promises a delay.
+      const interrupted = await sleep(record.nextDelayMs, signal);
+      if (interrupted) {
+        record.nextDelayMs = 0;
+        return { ok: false, cancelled: true, error: lastReason };
+      }
+    }
   }
 
   return { ok: false, error: lastReason };
@@ -832,6 +868,21 @@ function verifyOperations(nodes, operations) {
   }
 }
 
+// The optional fourth argument of executeWorkflowAsync carries an
+// AbortSignal as `{ signal }`. Omitting it — or passing undefined, or an
+// options object without a signal — keeps the previous behavior; anything
+// else is a caller error reported before a single node executes.
+function resolveRunSignal(options) {
+  if (options === undefined) return null;
+  if (!isUsableObject(options)) {
+    throw new TypeError('executeWorkflowAsync options must be an object with an optional "signal" AbortSignal');
+  }
+  if (!Object.hasOwn(options, 'signal') || options.signal === undefined) return null;
+  const { signal } = options;
+  if (signal instanceof AbortSignal) return signal;
+  throw new TypeError('executeWorkflowAsync options.signal must be an AbortSignal');
+}
+
 export function executeWorkflow(workflow, input = {}) {
   const nodes = validateWorkflow(workflow);
   // Business operations are asynchronous: the synchronous entry must refuse
@@ -884,13 +935,41 @@ async function withCompensation(result, state, operations) {
   return result;
 }
 
-export async function executeWorkflowAsync(workflow, input = {}, operations = {}) {
+// The cancelled terminal shape: the run stops where it is, keeps the
+// context, trace and attempt records produced so far, and never carries a
+// success result. Compensation for already-succeeded actions is attached by
+// withCompensation under the usual rules.
+function cancelledResult(state) {
+  return {
+    status: 'cancelled',
+    context: state.context,
+    trace: state.trace,
+    actionAttempts: state.actionAttempts,
+  };
+}
+
+export async function executeWorkflowAsync(workflow, input = {}, operations = {}, options = undefined) {
+  const signal = resolveRunSignal(options);
   const nodes = validateWorkflow(workflow);
   verifyOperations(nodes, operations);
 
   const state = createRunState(nodes, workflow, input);
 
+  // A signal that is already aborted stops the run before the first node —
+  // but only after the definition and the operation registrations above have
+  // been checked. Nothing executes and nothing is compensated.
+  if (signal && signal.aborted) {
+    return withCompensation(cancelledResult(state), state, operations);
+  }
+
   for (;;) {
+    // Once the signal fires, no new regular node runs and no new business
+    // action attempt starts; the run ends cancelled with whatever state it
+    // reached, even if an end node was already visited on another branch.
+    if (signal && signal.aborted) {
+      return withCompensation(cancelledResult(state), state, operations);
+    }
+
     const ready = pickReadyNode(state);
 
     if (!ready) {
@@ -928,8 +1007,13 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
         // Nodes execute one at a time in declaration order; awaiting here
         // never lets another node jump ahead.
         const actionResult = await runBusinessAction(
-          ready, binding, operations[binding.name], state.context, state.actionAttempts);
+          ready, binding, operations[binding.name], state.context, state.actionAttempts, signal);
         if (!actionResult.ok) {
+          if (actionResult.cancelled) {
+            // Cancelled while the action was in flight or waiting to retry:
+            // the attempt records produced so far stay as they are.
+            return withCompensation(cancelledResult(state), state, operations);
+          }
           // Retries are exhausted: stop immediately with prior input/output
           // preserved, no output for this node and no successors activated —
           // even if an end node was already reached — then compensate every
