@@ -50,20 +50,39 @@ Comparison operators:
 
 - `eq` — strict equality (`===`) against the comparison value; types are never coerced.
 - `gte` / `lte` — numeric ordering. Values are converted with JavaScript numeric conversion (numeric strings, booleans and `null` convert, e.g. `"10"`, `true`, `null`), but **both** sides must convert to a finite number. Objects and arrays never convert, even though `Number([])` is `0`.
-- `exists` — takes only `field` and `operator`; true when the field is present as an own property. `null`, `""`, `0`, and `false` all count as present.
+- `exists` — takes only the left side (`field` or `outputField`) and `operator`; true when the left side is present as an own property. `null`, `""`, `0`, `false`, and `undefined` all count as present.
+
+A comparison names its left side with exactly one of:
+
+- `field` — a dot-separated path into the run input, or
+- `outputField` — a reference to a successful action's output (see below).
 
 A normal comparison names its right side with exactly one of:
 
-- `value` — a string, finite number, boolean, or `null` constant, or
-- `valueField` — a dot-separated path to another input field.
+- `value` — a string, finite number, boolean, or `null` constant,
+- `valueField` — a dot-separated path to another input field, or
+- `valueOutputField` — a reference to a successful action's output.
 
-If either compared field is missing, an ordinary comparison is `false` (this does not apply to `exists`).
+If either side is missing, an ordinary comparison is `false` (this does not apply to `exists`).
 
-All field paths are dot-separated and read only own properties at each level; a non-object parent counts as missing. Empty paths, empty segments, and `__proto__` / `prototype` / `constructor` segments are forbidden.
+All input field paths are dot-separated and read only own properties at each level; a non-object parent counts as missing. Empty paths, empty segments, and `__proto__` / `prototype` / `constructor` segments are forbidden.
 
-The whole condition tree of every condition node is checked at definition time — including branches that execution would never take. Unknown operators, empty `all`/`any`, children that are not conditions, mixing multiple compound keys (or compound keys with comparison keys), illegal comparison values, and non-finite numeric constants are rejected with the node id and a child position such as `$.all[1].not`, before the workflow runs.
+### Output references
 
-At execution time, a numeric comparison that is actually evaluated (i.e. not short-circuited away) against an object, an array, or a value that does not convert to a finite number stops the workflow with `status: "invalid_condition"`, reporting the node id, child position, and reason. The `context` and `trace` are preserved; the trace contains the failing condition node and no further nodes execute.
+An output reference reads the value a successful action node stored in the run's output. It is a non-array object:
+
+```json
+{ "nodeId": "risk-check", "path": "risk.score" }
+```
+
+- `nodeId` is matched as a whole string (dots are literal characters, not path separators) and must name an `action` node in this workflow definition.
+- `path` is optional; when omitted the reference reads the action's entire return value. When present it follows the same segment rules as input paths (non-empty, no empty segments, no `__proto__` / `prototype` / `constructor`).
+
+At execution time a reference reads only outputs saved by actions that succeeded in this run — failed attempts and compensation returns are never read. An action that has not run, was never activated, or sits on an untaken branch is simply missing; a reference never activates an action, never waits for a future result, and adds no dependency. A path walks own properties level by level; encountering an array or a non-object parent value counts as missing, as does a missing property. A successfully saved `null`, `""`, `0`, `false`, or `undefined` is still present. The synchronous entry can reference message action outputs the same way.
+
+The whole condition tree of every condition node is checked at definition time — including branches that execution would never take. Unknown operators, empty `all`/`any`, children that are not conditions, mixing multiple compound keys (or compound keys with comparison keys), illegal comparison values, non-finite numeric constants, malformed output references, references to missing or non-action nodes, and source conflicts (both `field` and `outputField`, or more than one right-side source) are rejected with the node id and a child position such as `$.all[1].not`, before the workflow runs.
+
+At execution time, a numeric comparison that is actually evaluated (i.e. not short-circuited away) against an object, an array, or a value that does not convert to a finite number stops the workflow with `status: "invalid_condition"`, reporting the node id, child position, and reason. The `context` and `trace` are preserved; the trace contains the failing condition node and no further nodes execute. Earlier successful business actions are compensated under the usual rules.
 
 ## Form input validation
 
