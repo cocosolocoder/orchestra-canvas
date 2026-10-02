@@ -159,10 +159,34 @@ function toComparableNumber(value) {
   return Number.isFinite(converted) ? converted : null;
 }
 
+// Validates an action-output reference of the form
+// { "nodeId": "<action node id>", "path": "<optional dot-separated path>" }.
+// The node id is matched as a whole string — dots inside it are not path
+// separators — and must name an action node of this very definition. The
+// optional path follows the same rules as input field paths; when it is
+// absent the reference reads the action's whole return value.
+function compileOutputReference(reference, nodes, label) {
+  if (!isUsableObject(reference)) {
+    throw new Error(`${label}: output reference must be an object with a nodeId and an optional path`);
+  }
+  if (typeof reference.nodeId !== 'string' || reference.nodeId.length === 0) {
+    throw new Error(`${label}: output reference nodeId must be a non-empty string`);
+  }
+  const target = nodes.get(reference.nodeId);
+  if (!target || target.type !== 'action') {
+    throw new Error(`${label}: output reference nodeId "${reference.nodeId}" must name an action node of this workflow`);
+  }
+  let segments = null;
+  if (Object.hasOwn(reference, 'path') && reference.path !== undefined) {
+    segments = parsePathSegments(reference.path, `${label} path`);
+  }
+  return { source: 'output', nodeId: reference.nodeId, segments };
+}
+
 // Walks every condition node (including untaken branches) and turns it into a
 // pre-validated, pre-resolved structure. Any malformed condition throws with a
 // node id and a `$`-style child position, before the workflow can execute.
-function compileCondition(condition, nodeId, position = '$', depth = 1) {
+function compileCondition(condition, nodeId, nodes, position = '$', depth = 1) {
   if (depth > MAX_CONDITION_DEPTH) {
     throw new Error(`condition node ${nodeId} at ${position}: conditions must not be nested deeper than ${MAX_CONDITION_DEPTH} levels`);
   }
@@ -178,16 +202,16 @@ function compileCondition(condition, nodeId, position = '$', depth = 1) {
     throw new Error(`condition node ${nodeId} at ${position}: condition must use only one of all, any or not`);
   }
 
-  const comparisonKeys = ['field', 'operator', 'value', 'valueField'];
+  const comparisonKeys = ['field', 'operator', 'value', 'valueField', 'outputField', 'valueOutputField'];
   const presentComparisonKeys = comparisonKeys.filter(key => Object.hasOwn(condition, key));
 
   if (comboKeys.length === 1) {
     if (presentComparisonKeys.length > 0) {
-      throw new Error(`condition node ${nodeId} at ${position}: ${comboKeys[0]} condition must not mix in field, operator, value or valueField`);
+      throw new Error(`condition node ${nodeId} at ${position}: ${comboKeys[0]} condition must not mix in field, operator, value, valueField, outputField or valueOutputField`);
     }
     const key = comboKeys[0];
     if (key === 'not') {
-      return { kind: 'not', child: compileCondition(condition.not, nodeId, `${position}.not`, depth + 1) };
+      return { kind: 'not', child: compileCondition(condition.not, nodeId, nodes, `${position}.not`, depth + 1) };
     }
     if (!Array.isArray(condition[key])) {
       throw new Error(`condition node ${nodeId} at ${position}: ${key} must be an array of conditions`);
@@ -198,53 +222,65 @@ function compileCondition(condition, nodeId, position = '$', depth = 1) {
     return {
       kind: key,
       children: condition[key].map((child, index) =>
-        compileCondition(child, nodeId, `${position}.${key}[${index}]`, depth + 1)),
+        compileCondition(child, nodeId, nodes, `${position}.${key}[${index}]`, depth + 1)),
     };
   }
 
   const where = `condition node ${nodeId} at ${position}`;
-  if (!Object.hasOwn(condition, 'field') || !Object.hasOwn(condition, 'operator')) {
+  const hasField = Object.hasOwn(condition, 'field');
+  const hasOutputField = Object.hasOwn(condition, 'outputField');
+  if ((!hasField && !hasOutputField) || !Object.hasOwn(condition, 'operator')) {
     throw new Error(`${where}: condition must be a comparison (field and operator) or a compound (all, any or not)`);
   }
-  const segments = parsePathSegments(condition.field, `${where} field`);
+  if (hasField && hasOutputField) {
+    throw new Error(`${where}: condition must specify exactly one of field or outputField`);
+  }
+  const left = hasField
+    ? { source: 'input', label: 'field', segments: parsePathSegments(condition.field, `${where} field`) }
+    : { label: 'outputField', ...compileOutputReference(condition.outputField, nodes, `${where} outputField`) };
 
   if (!['eq', 'gte', 'lte', 'exists'].includes(condition.operator)) {
     throw new Error(`${where}: unknown condition operator: ${condition.operator}`);
   }
 
-  const unexpected = presentComparisonKeys.filter(key => key !== 'field' && key !== 'operator');
+  const unexpected = presentComparisonKeys.filter(key => !['field', 'operator', 'outputField'].includes(key));
   if (condition.operator === 'exists') {
     if (unexpected.length > 0) {
-      throw new Error(`${where}: exists only takes field and operator`);
+      throw new Error(`${where}: exists only takes a left side (field or outputField) and operator`);
     }
-    return { kind: 'comparison', operator: 'exists', segments };
+    return { kind: 'comparison', operator: 'exists', left };
   }
 
   const hasValue = Object.hasOwn(condition, 'value');
   const hasValueField = Object.hasOwn(condition, 'valueField');
-  if (hasValue === hasValueField) {
-    throw new Error(`${where}: condition must specify exactly one of value or valueField`);
+  const hasValueOutputField = Object.hasOwn(condition, 'valueOutputField');
+  if ([hasValue, hasValueField, hasValueOutputField].filter(Boolean).length !== 1) {
+    throw new Error(`${where}: condition must specify exactly one of value, valueField or valueOutputField`);
   }
+  let right;
   if (hasValueField) {
     if (typeof condition.valueField !== 'string') {
       throw new Error(`${where} valueField: path must be a non-empty string`);
     }
-    return {
-      kind: 'comparison', operator: condition.operator, segments,
-      valueSegments: parsePathSegments(condition.valueField, `${where} valueField`),
+    right = {
+      source: 'input', label: 'valueField',
+      segments: parsePathSegments(condition.valueField, `${where} valueField`),
     };
-  }
-  if (!isComparableConstant(condition.value)) {
-    throw new Error(`${where}: value must be a string, finite number, boolean or null`);
-  }
-  const compiled = { kind: 'comparison', operator: condition.operator, segments, value: condition.value };
-  if (condition.operator !== 'eq') {
-    compiled.numericValue = toComparableNumber(condition.value);
-    if (compiled.numericValue === null) {
-      throw new Error(`${where}: value for ${condition.operator} must convert to a finite number`);
+  } else if (hasValueOutputField) {
+    right = { label: 'valueOutputField', ...compileOutputReference(condition.valueOutputField, nodes, `${where} valueOutputField`) };
+  } else {
+    if (!isComparableConstant(condition.value)) {
+      throw new Error(`${where}: value must be a string, finite number, boolean or null`);
+    }
+    right = { source: 'constant', label: 'value', value: condition.value };
+    if (condition.operator !== 'eq') {
+      right.numericValue = toComparableNumber(condition.value);
+      if (right.numericValue === null) {
+        throw new Error(`${where}: value for ${condition.operator} must convert to a finite number`);
+      }
     }
   }
-  return compiled;
+  return { kind: 'comparison', operator: condition.operator, left, right };
 }
 
 const formSchemas = new WeakMap();
@@ -471,7 +507,7 @@ export function validateWorkflow(workflow) {
       formSchemas.set(node, compileFormSchema(node));
     }
     if (node.type === 'condition') {
-      compiledConditions.set(node, compileCondition(node.condition, node.id));
+      compiledConditions.set(node, compileCondition(node.condition, node.id, nodes));
     }
     if (node.type === 'action') {
       actionBindings.set(node, compileAction(node));
@@ -500,19 +536,36 @@ function lookupOwn(root, segments) {
   return { exists: true, value: current };
 }
 
-// Evaluates a compiled condition against the cloned execution input. Compounds
-// short-circuit in declaration order, so a bad value inside a skipped child is
-// never observed. A non-skipped numeric comparison whose inputs cannot convert
-// to finite numbers is reported as an invalid_condition error instead.
-function runCondition(compiled, input, nodeId, position = '$') {
+// Resolves one side of a comparison. Input references read the run's input;
+// output references read the output a successful action saved earlier in this
+// run (never a failed attempt or a compensation return). A referenced action
+// that has not run — or was never activated — simply has no output: the
+// reference neither activates it nor waits for it. Path levels read own
+// properties only, and an array or non-object parent counts as missing. A
+// saved null, "", 0, false or undefined still counts as present.
+function resolveSide(side, input, output) {
+  if (side.source === 'constant') return { exists: true, value: side.value };
+  if (side.source === 'input') return lookupOwn(input, side.segments);
+  if (!Object.hasOwn(output, side.nodeId)) return { exists: false };
+  const saved = output[side.nodeId];
+  if (side.segments === null) return { exists: true, value: saved };
+  return lookupOwn(saved, side.segments);
+}
+
+// Evaluates a compiled condition against the cloned execution input and the
+// outputs saved by successful actions so far. Compounds short-circuit in
+// declaration order, so a bad value inside a skipped child is never observed.
+// A non-skipped numeric comparison whose inputs cannot convert to finite
+// numbers is reported as an invalid_condition error instead.
+function runCondition(compiled, input, output, nodeId, position = '$') {
   if (compiled.kind === 'not') {
-    const child = runCondition(compiled.child, input, nodeId, `${position}.not`);
+    const child = runCondition(compiled.child, input, output, nodeId, `${position}.not`);
     if (!child.ok) return child;
     return { ok: true, value: !child.value };
   }
   if (compiled.kind === 'all' || compiled.kind === 'any') {
     for (let i = 0; i < compiled.children.length; i += 1) {
-      const child = runCondition(compiled.children[i], input, nodeId, `${position}.${compiled.kind}[${i}]`);
+      const child = runCondition(compiled.children[i], input, output, nodeId, `${position}.${compiled.kind}[${i}]`);
       if (!child.ok) return child;
       if (compiled.kind === 'all' && !child.value) return { ok: true, value: false };
       if (compiled.kind === 'any' && child.value) return { ok: true, value: true };
@@ -521,36 +574,30 @@ function runCondition(compiled, input, nodeId, position = '$') {
   }
 
   const where = `condition node ${nodeId} at ${position}`;
-  const left = lookupOwn(input, compiled.segments);
+  const left = resolveSide(compiled.left, input, output);
   if (!left.exists) return { ok: true, value: false };
 
   if (compiled.operator === 'exists') return { ok: true, value: true };
 
-  let right;
-  if (compiled.valueSegments) {
-    const lookedUp = lookupOwn(input, compiled.valueSegments);
-    if (!lookedUp.exists) return { ok: true, value: false };
-    right = lookedUp.value;
-  } else {
-    right = compiled.value;
-  }
+  const right = resolveSide(compiled.right, input, output);
+  if (!right.exists) return { ok: true, value: false };
 
   if (compiled.operator === 'eq') {
-    return { ok: true, value: left.value === right };
+    return { ok: true, value: left.value === right.value };
   }
 
   const leftNumber = toComparableNumber(left.value);
   if (leftNumber === null) {
-    return { ok: false, error: `${where}: value at field cannot convert to a finite number` };
+    return { ok: false, error: `${where}: value at ${compiled.left.label} cannot convert to a finite number` };
   }
   let rightNumber;
-  if (compiled.valueSegments) {
-    rightNumber = toComparableNumber(right);
-    if (rightNumber === null) {
-      return { ok: false, error: `${where}: value at valueField cannot convert to a finite number` };
-    }
+  if (compiled.right.source === 'constant') {
+    rightNumber = compiled.right.numericValue;
   } else {
-    rightNumber = compiled.numericValue;
+    rightNumber = toComparableNumber(right.value);
+    if (rightNumber === null) {
+      return { ok: false, error: `${where}: value at ${compiled.right.label} cannot convert to a finite number` };
+    }
   }
   if (compiled.operator === 'gte') return { ok: true, value: leftNumber >= rightNumber };
   return { ok: true, value: leftNumber <= rightNumber };
@@ -832,7 +879,7 @@ function applyRegularNode(node, state) {
     }
   }
   if (node.type === 'condition') {
-    const outcome = runCondition(compiledConditions.get(node), state.context.input, node.id);
+    const outcome = runCondition(compiledConditions.get(node), state.context.input, state.context.output, node.id);
     if (!outcome.ok) {
       return { status: 'invalid_condition', context: state.context, trace: state.trace, error: outcome.error };
     }

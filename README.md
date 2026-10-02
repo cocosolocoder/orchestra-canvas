@@ -50,14 +50,22 @@ Comparison operators:
 
 - `eq` — strict equality (`===`) against the comparison value; types are never coerced.
 - `gte` / `lte` — numeric ordering. Values are converted with JavaScript numeric conversion (numeric strings, booleans and `null` convert, e.g. `"10"`, `true`, `null`), but **both** sides must convert to a finite number. Objects and arrays never convert, even though `Number([])` is `0`.
-- `exists` — takes only `field` and `operator`; true when the field is present as an own property. `null`, `""`, `0`, and `false` all count as present.
+- `exists` — takes only a left side and `operator`; true when the field is present as an own property. `null`, `""`, `0`, and `false` all count as present.
 
-A normal comparison names its right side with exactly one of:
+A normal comparison names its left side with exactly one of:
 
-- `value` — a string, finite number, boolean, or `null` constant, or
-- `valueField` — a dot-separated path to another input field.
+- `field` — a dot-separated path into the input, or
+- `outputField` — an action-output reference `{"nodeId": "<action id>", "path": "<optional path>"}` reading a value the named action saved earlier in this run,
 
-If either compared field is missing, an ordinary comparison is `false` (this does not apply to `exists`).
+and its right side with exactly one of:
+
+- `value` — a string, finite number, boolean, or `null` constant,
+- `valueField` — a dot-separated path to another input field, or
+- `valueOutputField` — an action-output reference, same shape as `outputField`.
+
+An output reference's `nodeId` is matched as a whole string (dots inside it are not path separators) and must name an `action` node of the same definition; when `path` is omitted the reference reads the action's whole saved return value. References only see outputs saved by **successful** actions earlier in the current run — never failed attempts or compensation results. A referenced action that has not run (or was never activated) simply has no output: the reference neither activates it, waits for it, nor adds a dependency. Reference paths read own properties level by level, and an array or non-object parent counts as missing. `exists` takes only a left side (`field` or `outputField`) plus `operator`.
+
+If either compared side is missing, an ordinary comparison is `false` (this does not apply to `exists`).
 
 All field paths are dot-separated and read only own properties at each level; a non-object parent counts as missing. Empty paths, empty segments, and `__proto__` / `prototype` / `constructor` segments are forbidden.
 
