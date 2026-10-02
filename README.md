@@ -181,4 +181,22 @@ The original terminal status, failure details, `context`, regular `trace`, and `
 
 `validateWorkflow` rejects a `compensation` that is not an object, compensation declared on anything but a business action (including legacy message actions), a missing, non-string or blank operation name, and an illegal compensation retry block. Before the first node executes, `executeWorkflowAsync` additionally confirms that every declared compensation name — including actions on untaken branches and entry-unreachable nodes — has a function implementation. Any configuration problem throws naming the node and reason without invoking a single operation. The synchronous `executeWorkflow` and the command-line demo keep their existing behavior; workflows without compensation follow the previous execution rules exactly.
 
+## Cancellation
+
+`executeWorkflowAsync(workflow, input?, operations?, options?)` accepts a fourth optional argument `{ signal }` carrying an [`AbortSignal`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal). Omitting it, passing `undefined`, or passing `{}` / `{ signal: undefined }` keeps the existing behavior; any other `signal` value (a string, `null`, a plain object, …) throws before a single node executes. Each run uses its own signal, so aborting one run never affects other runs of the same workflow.
+
+```js
+const controller = new AbortController();
+const execution = executeWorkflowAsync(workflow, input, operations, { signal: controller.signal });
+controller.abort();
+```
+
+When the signal aborts, no new normal node runs and no further business-action attempt starts. The run resolves with `status: "cancelled"` and the gathered `context`, `trace`, `actionAttempts`, `compensationStatus` and `compensationAttempts`, with no successful `result`.
+
+- If the signal is already aborted before the run starts, definition and operation registration checks still run first (a failure throws as usual); once they pass, the result has an empty trace and empty attempt records, an independent copy of the input, and no business or compensation operation is invoked.
+- An in-flight business operation is not forcibly interrupted: the run waits for that one operation to settle. If it succeeds and its return value is structured-cloneable, the output and success record are kept and the action is compensated like any success; if it throws, rejects, or returns an uncloneable value, the failure record is kept with no output and no retry. Either way the terminal state is `cancelled` — even if this was the last allowed attempt.
+- A retry wait is ended immediately: the failed attempt's error is preserved and its `nextDelayMs` becomes `0`, and no new attempt starts afterwards — not even when the retry delay would have been zero.
+- Compensation follows the usual rules: only successful actions that declared a compensation are undone, in reverse success order, each with its own success-time snapshot and retry config; a failed compensation still leaves earlier actions to be processed. Aborting during compensation does not interrupt it or call anything twice, and successful outputs are never deleted. With nothing to compensate, `compensationStatus` is `not_needed`.
+- A run that reached an `end` node while other activated branches are still unfinished can still be cancelled. Cancellation that arrives only after normal execution has already determined its terminal state (including a failure that is being compensated) cannot rewrite the result.
+
 

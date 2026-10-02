@@ -613,6 +613,24 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Like sleep, but an aborted signal ends the wait early so a cancelled run
+// never lingers in a retry backoff. When no signal is given this is exactly
+// sleep.
+function sleepOrAbort(ms, signal) {
+  if (!signal) return sleep(ms);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 function describeError(error) {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -630,32 +648,56 @@ function retryDelay(retry, failedAttempt) {
 // structured clones of the current input and the successful outputs so far;
 // mutations by a failed attempt are discarded, and the stored success value
 // is a clone independent of any object the implementation keeps holding.
-async function runBusinessAction(node, binding, implementation, context, actionAttempts) {
+//
+// An aborted signal stops new attempts from starting and cuts retry waits
+// short. An attempt already in flight is allowed to settle: a success is
+// stored and compensated, a failure keeps its record with no retry. Either
+// way the run ends in `cancelled`.
+async function runBusinessAction(node, binding, implementation, context, actionAttempts, signal) {
   const { retry } = binding;
   let lastReason = null;
 
   for (let attempt = 1; attempt <= retry.attempts; attempt += 1) {
+    if (signal && signal.aborted) {
+      // Cancellation never starts a new attempt — not even when the retry
+      // delay would have been zero.
+      return { ok: false, cancelled: true, error: lastReason };
+    }
+
     const inputCopy = structuredClone(context.input);
     const outputCopy = structuredClone(context.output);
     const record = { nodeId: node.id, attempt, ok: false, error: null, nextDelayMs: 0 };
     let returned;
+    let failed = false;
     try {
       returned = await implementation(inputCopy, outputCopy, node.id, attempt);
     } catch (error) {
+      failed = true;
       lastReason = describeError(error);
       record.error = lastReason;
     }
 
-    if (record.error === null) {
+    if (!failed) {
       try {
         returned = structuredClone(returned);
       } catch (error) {
+        failed = true;
         lastReason = `operation "${binding.name}" returned a value that cannot be structured-cloned`;
         record.error = lastReason;
       }
     }
 
-    if (record.error === null) {
+    if (signal && signal.aborted) {
+      // The operation settled after cancellation: a success is stored and
+      // queued for compensation, a failure keeps its record with no output
+      // and no further attempt.
+      if (!failed) record.ok = true;
+      actionAttempts.push(record);
+      if (failed) return { ok: false, cancelled: true, error: lastReason };
+      return { ok: true, cancelled: true, value: returned };
+    }
+
+    if (!failed) {
       record.ok = true;
       actionAttempts.push(record);
       return { ok: true, value: returned };
@@ -663,7 +705,15 @@ async function runBusinessAction(node, binding, implementation, context, actionA
 
     record.nextDelayMs = attempt < retry.attempts ? retryDelay(retry, attempt) : 0;
     actionAttempts.push(record);
-    if (record.nextDelayMs > 0) await sleep(record.nextDelayMs);
+    if (record.nextDelayMs > 0) {
+      await sleepOrAbort(record.nextDelayMs, signal);
+      if (signal && signal.aborted) {
+        // The wait ended early: the failure record keeps its error but no
+        // further attempt may start.
+        record.nextDelayMs = 0;
+        return { ok: false, cancelled: true, error: lastReason };
+      }
+    }
   }
 
   return { ok: false, error: lastReason };
@@ -832,6 +882,35 @@ function verifyOperations(nodes, operations) {
   }
 }
 
+// Validates the optional fourth argument. Only an AbortSignal (or an absent
+// / undefined signal) is accepted; anything else is rejected before a single
+// node executes.
+function resolveSignal(options) {
+  if (options === undefined) return null;
+  if (!isUsableObject(options)) {
+    throw new TypeError('executeWorkflowAsync expects options to be an object');
+  }
+  if (!Object.hasOwn(options, 'signal') || options.signal === undefined) return null;
+  const { signal } = options;
+  if (!(signal instanceof AbortSignal)) {
+    throw new TypeError('executeWorkflowAsync expects options.signal to be an AbortSignal');
+  }
+  return signal;
+}
+
+// Terminal result for a cancelled run. The context, trace and attempt records
+// gathered so far are preserved; successful compensable actions are still
+// rolled back, while no further normal node runs.
+async function cancelRun(state, operations) {
+  const result = {
+    status: 'cancelled',
+    context: state.context,
+    trace: state.trace,
+    actionAttempts: state.actionAttempts,
+  };
+  return withCompensation(result, state, operations);
+}
+
 export function executeWorkflow(workflow, input = {}) {
   const nodes = validateWorkflow(workflow);
   // Business operations are asynchronous: the synchronous entry must refuse
@@ -884,11 +963,19 @@ async function withCompensation(result, state, operations) {
   return result;
 }
 
-export async function executeWorkflowAsync(workflow, input = {}, operations = {}) {
+export async function executeWorkflowAsync(workflow, input = {}, operations = {}, options = {}) {
   const nodes = validateWorkflow(workflow);
   verifyOperations(nodes, operations);
+  const signal = resolveSignal(options);
 
   const state = createRunState(nodes, workflow, input);
+
+  if (signal && signal.aborted) {
+    // Cancelled before the run started: definition and operation checks above
+    // already passed, so return an empty trace with an independent input copy
+    // and invoke no business or compensation operation.
+    return cancelRun(state, operations);
+  }
 
   for (;;) {
     const ready = pickReadyNode(state);
@@ -914,6 +1001,12 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
       throw new Error('workflow did not terminate; a cycle is present');
     }
 
+    if (signal && signal.aborted) {
+      // Cancellation stops before the next node is traced, including after
+      // an end node while other activated branches are still unfinished.
+      return cancelRun(state, operations);
+    }
+
     state.trace.push({ nodeId: ready.id, type: ready.type });
     if (ready.type === 'end') {
       state.endReached = true;
@@ -928,8 +1021,13 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
         // Nodes execute one at a time in declaration order; awaiting here
         // never lets another node jump ahead.
         const actionResult = await runBusinessAction(
-          ready, binding, operations[binding.name], state.context, state.actionAttempts);
+          ready, binding, operations[binding.name], state.context, state.actionAttempts, signal);
         if (!actionResult.ok) {
+          if (actionResult.cancelled) {
+            // The signal aborted while this action was running or retrying:
+            // terminal state is cancelled, never action_failed.
+            return cancelRun(state, operations);
+          }
           // Retries are exhausted: stop immediately with prior input/output
           // preserved, no output for this node and no successors activated —
           // even if an end node was already reached — then compensate every
@@ -954,6 +1052,11 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
           // actions and shared join nodes are scheduled for compensation
           // exactly once.
           state.compensable.push({ nodeId: ready.id, binding, snapshot: compensationSnapshot });
+        }
+        if (actionResult.cancelled) {
+          // The operation settled after cancellation: its output and success
+          // record are kept and compensated, but no successors activate.
+          return cancelRun(state, operations);
         }
         for (const target of successorTargets.get(ready)) state.activated.add(target);
         state.completed.add(ready.id);
