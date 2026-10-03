@@ -305,6 +305,7 @@ const compiledConditions = new WeakMap();
 const successorTargets = new WeakMap();
 const nodeDependencies = new WeakMap();
 const actionBindings = new WeakMap();
+const endResultSnapshots = new WeakMap();
 
 const RETRY_FIELDS = ['attempts', 'initialDelayMs', 'backoffFactor', 'maxDelayMs'];
 const DEFAULT_RETRY = { attempts: 1, initialDelayMs: 0, backoffFactor: 1, maxDelayMs: 0 };
@@ -389,6 +390,23 @@ function compileAction(node) {
   }
 
   return { name, retry, compensation };
+}
+
+// Captures an end node's configured result as an independent structured
+// clone at definition time. A missing result (absent key or explicit
+// undefined) is normalized to null, matching the runtime contract; null,
+// strings, numbers and booleans — including 0, false and "" — are cloned
+// unchanged. A value the runtime cannot copy (a function, a Promise, a
+// Symbol, anything nested in an object or array) is a definition error that
+// names the end node and the reason, so it is rejected before any node or
+// business action can run. Untaken branches are validated just the same.
+function compileEndResult(node) {
+  if (!Object.hasOwn(node, 'result') || node.result === undefined) return null;
+  try {
+    return structuredClone(node.result);
+  } catch (error) {
+    throw new Error(`end node ${node.id}: result cannot be structured-cloned (${error && error.message ? error.message : error})`);
+  }
 }
 
 // Resolves the outgoing edges of a node. Trigger, form and action nodes may
@@ -553,6 +571,9 @@ export function validateWorkflow(workflow) {
     }
     if (node.type === 'action') {
       actionBindings.set(node, compileAction(node));
+    }
+    if (node.type === 'end') {
+      endResultSnapshots.set(node, compileEndResult(node));
     }
   }
 
@@ -999,8 +1020,13 @@ function advanceSchedule(state) {
   if (ready.type === 'end') {
     // Reaching an end node records the result but never stops other
     // activated branches; the run completes once nothing can still run.
+    // The recorded value is a fresh clone of the validation-time snapshot
+    // owned by this run: mutating the returned result — including nested
+    // objects and arrays — can neither rewrite the workflow definition nor
+    // leak into another run, and a null/primitive result keeps its exact
+    // value (0, false and "" are never normalized away).
     state.endReached = true;
-    state.endResult = ready.result ?? null;
+    state.endResult = structuredClone(endResultSnapshots.get(ready));
     state.completed.add(ready.id);
     return { kind: 'end' };
   }
