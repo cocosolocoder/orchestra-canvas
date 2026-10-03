@@ -388,6 +388,22 @@ function compileAction(node) {
     compensation = { name: config.operation, retry: compRetry };
   }
 
+  // A legacy message action (no operation) may carry a structured object or
+  // array as its message, and the output it saves is snapshotted per run. A
+  // value the structured clone algorithm cannot deliver — a bare function or
+  // a function nested inside an object/array — is a definition error naming
+  // the action and the reason, for every message action including actions on
+  // untaken branches and entry-unreachable ones. An action that names an
+  // operation ignores its message entirely, so an unused uncloneable message
+  // is never rejected for it.
+  if (name === null && Object.hasOwn(node, 'message') && node.message !== undefined) {
+    try {
+      structuredClone(node.message);
+    } catch {
+      throw new Error(`action node ${node.id}: message must be a structured-cloneable value (objects and arrays must not contain functions)`);
+    }
+  }
+
   return { name, retry, compensation };
 }
 
@@ -1038,7 +1054,18 @@ function advanceSchedule(state) {
 // or null when execution should continue.
 function applyRegularNode(node, state) {
   if (node.type === 'action') {
-    setNodeOutput(state.context.output, node.id, node.message ?? `action:${node.id}`);
+    // Snapshot the legacy message at this action's own execution moment: the
+    // saved output is this run's independent deep copy, so editing nested
+    // fields, adding or deleting properties, or changing array members of the
+    // returned output never reaches the definition, another run, or an output
+    // this action recorded while another activated branch is still waiting.
+    // An unset, undefined or null message defaults to action:<node id>;
+    // "", 0 and false pass through untouched. Validation already guarantees
+    // that an explicit message is structured-cloneable, so this cannot throw
+    // mid-run.
+    const hasMessage = Object.hasOwn(node, 'message') && node.message !== undefined && node.message !== null;
+    const value = hasMessage ? structuredClone(node.message) : `action:${node.id}`;
+    setNodeOutput(state.context.output, node.id, value);
   }
   if (node.type === 'form') {
     const compiled = formSchemas.get(node);

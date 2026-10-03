@@ -105,7 +105,7 @@ Workflow definition (`validateWorkflow`, also run at the start of execution) che
 
 ## Business actions
 
-An `action` node either keeps its legacy behavior (`message`, defaulting to `action:<nodeId>`) or performs a real business operation. Name the operation on the node and supply implementations by name when running:
+An `action` node either keeps its legacy behavior (`message`, defaulting to `action:<nodeId>`) or performs a real business operation. A legacy message may be a string or any structured value — objects, arrays and structured-cloneable built-ins are all accepted. The saved output is an independent deep copy of the message, taken at the moment that action actually executes (both through `executeWorkflow` and `executeWorkflowAsync`): editing nested fields, adding or deleting properties, or changing array members on a returned run's output never touches the workflow definition, other runs, or an output the action recorded while another activated branch is still waiting, and later conditions and business actions keep reading the value as it was when the action ran. An unset, `undefined` or `null` message defaults to `action:<nodeId>`, while `""`, `0` and `false` are kept verbatim. Name the operation on the node and supply implementations by name when running:
 
 ```json
 {
@@ -144,7 +144,7 @@ Retry configuration (`retry`) is either omitted — exactly one attempt — or p
 
 The first retry waits `initialDelayMs`; each later wait grows by `backoffFactor` and is capped at `maxDelayMs` (a zero initial delay always stays zero). No wait happens after the final attempt.
 
-Before the run starts — covering untaken branches and entry-unreachable nodes — every action's operation name and retry config is validated (a name must be a non-blank string, and all parameter rules above apply), and every named operation must exist in `operations` as a function. Any violation throws with the node id and reason without invoking an operation even once.
+Before the run starts — covering untaken branches and entry-unreachable nodes — every action's operation name and retry config is validated (a name must be a non-blank string, and all parameter rules above apply), and every named operation must exist in `operations` as a function. A legacy message action's `message` must also be structured-cloneable: a bare function or an object or array containing a function is rejected with the action node id and reason, for every legacy message action including those on untaken branches and entry-unreachable ones. An action that names an operation ignores its `message`, so an unused uncloneable message is never rejected for it. Any violation throws with the node id and reason without invoking an operation even once.
 
 Nodes still execute one at a time in declaration order: while an action waits or retries, no other node is scheduled. Successors activate and dependencies satisfy only after the action succeeds, and a shared join still runs exactly once. When retries are exhausted the run immediately returns:
 
