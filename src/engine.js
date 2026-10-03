@@ -720,9 +720,36 @@ function sleep(ms, signal) {
   });
 }
 
+const UNREADABLE_ERROR_MESSAGE = '无法读取异常信息';
+
+// Turns a thrown or rejected value into the string recorded on a failed
+// attempt. An Error whose message is a readable string keeps it verbatim —
+// an empty string is still a failure — and thrown strings, numbers,
+// booleans, null and undefined keep their usual String() representation.
+// When the text cannot be read (a non-string message, a message getter that
+// throws, or a value String() cannot convert), a fixed placeholder is
+// recorded so the run result is never rejected; the original value is left
+// untouched. Both synchronous throws and rejected Promises reach this via
+// the same try/await.
 function describeError(error) {
-  if (error instanceof Error) return error.message;
-  return String(error);
+  if (error instanceof Error) {
+    let message;
+    try {
+      message = error.message;
+    } catch {
+      return UNREADABLE_ERROR_MESSAGE;
+    }
+    return typeof message === 'string' ? message : UNREADABLE_ERROR_MESSAGE;
+  }
+  if (error === null || typeof error === 'string'
+    || typeof error === 'number' || typeof error === 'boolean') {
+    return String(error);
+  }
+  try {
+    return String(error);
+  } catch {
+    return UNREADABLE_ERROR_MESSAGE;
+  }
 }
 
 // Delay before the attempt following the given (failed) attempt number: the
