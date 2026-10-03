@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { executeWorkflow, validateWorkflow } from '../src/engine.js';
+import { executeWorkflow, executeWorkflowAsync, validateWorkflow } from '../src/engine.js';
 
 const workflow = {
   id: 'routing',
@@ -702,5 +702,159 @@ test('rejects cycles formed by edges, dependencies or both, including unreachabl
     ],
   };
   assert.throws(() => executeWorkflow(unreachableCycle, {}), /cycle is present: lost1 -> lost2 -> lost1/);
+});
+
+const LONG_CHAIN_SIZE = 20000;
+
+// trigger n0 -> action n1 -> ... -> action n19998 -> end n19999
+function successorChainWorkflow(size = LONG_CHAIN_SIZE) {
+  const nodes = [{ id: 'n0', type: 'trigger', next: 'n1' }];
+  for (let i = 1; i < size - 1; i += 1) {
+    nodes.push({ id: `n${i}`, type: 'action', next: `n${i + 1}` });
+  }
+  nodes.push({ id: `n${size - 1}`, type: 'end', result: 'done' });
+  return { id: 'long-edge-chain', entry: 'n0', nodes };
+}
+
+// The ordering chain is carried by explicit dependencies: d1 may run only
+// after d0, d2 only after d1, and so on; successor edges just converge on
+// the single end node.
+function dependencyChainWorkflow(size = LONG_CHAIN_SIZE) {
+  const nodes = [{ id: 'd0', type: 'trigger', next: 'done' }];
+  for (let i = 1; i < size; i += 1) {
+    nodes.push({ id: `d${i}`, type: 'action', dependsOn: [`d${i - 1}`], next: 'done' });
+  }
+  nodes.push({ id: 'done', type: 'end', result: 'done' });
+  return { id: 'long-dependency-chain', entry: 'd0', nodes };
+}
+
+function cycleChainFrom(error) {
+  return error.message.slice('cycle is present: '.length).split(' -> ');
+}
+
+function expectCycleError(validate) {
+  try {
+    validate();
+  } catch (error) {
+    assert.match(error.message, /cycle is present: /);
+    return error;
+  }
+  assert.fail('expected a cycle error');
+}
+
+test('accepts a legal twenty-thousand-node chain joined by successors', () => {
+  assert.doesNotThrow(() => validateWorkflow(successorChainWorkflow()));
+});
+
+test('accepts a legal twenty-thousand-node chain joined by explicit dependencies', () => {
+  assert.doesNotThrow(() => validateWorkflow(dependencyChainWorkflow()));
+});
+
+test('validation of a long chain does not mutate the user definition', () => {
+  const workflow = successorChainWorkflow();
+  const snapshot = structuredClone(workflow);
+  validateWorkflow(workflow);
+  assert.deepEqual(workflow, snapshot);
+});
+
+test('a legal twenty-thousand-node chain executes to the end, synchronously and async', async () => {
+  const syncResult = executeWorkflow(successorChainWorkflow(), {});
+  assert.equal(syncResult.status, 'completed');
+  assert.equal(syncResult.result, 'done');
+  assert.equal(syncResult.trace.length, LONG_CHAIN_SIZE);
+
+  const asyncResult = await executeWorkflowAsync(successorChainWorkflow(), {});
+  assert.equal(asyncResult.status, 'completed');
+  assert.equal(asyncResult.result, 'done');
+  assert.equal(asyncResult.trace.length, LONG_CHAIN_SIZE);
+});
+
+test('a back edge at the end of a long chain reports only the cycle segment', () => {
+  const workflow = successorChainWorkflow();
+  // Turn the end node into an action whose successor jumps back up the chain.
+  workflow.nodes[LONG_CHAIN_SIZE - 1] = { id: `n${LONG_CHAIN_SIZE - 1}`, type: 'action', next: 'n5000' };
+
+  const error = expectCycleError(() => validateWorkflow(workflow));
+  const chain = cycleChainFrom(error);
+  assert.equal(chain[0], 'n5000');
+  assert.equal(chain[chain.length - 1], 'n5000');
+  assert.equal(chain.length, LONG_CHAIN_SIZE - 5000 + 1);
+  for (let i = 0; i < chain.length - 2; i += 1) {
+    assert.equal(chain[i], `n${5000 + i}`);
+  }
+  assert.equal(chain[chain.length - 2], `n${LONG_CHAIN_SIZE - 1}`);
+});
+
+test('a cycle mixing successors and dependencies deep in a chain names only real relations', () => {
+  const workflow = successorChainWorkflow();
+  // n19900 may run only after n19998, while successors already order
+  // n19900 -> ... -> n19998: the two relation kinds together close a cycle.
+  workflow.nodes[19900] = {
+    id: 'n19900', type: 'action', next: 'n19901', dependsOn: ['n19998'],
+  };
+
+  const error = expectCycleError(() => validateWorkflow(workflow));
+  const chain = cycleChainFrom(error);
+  assert.equal(chain[0], 'n19900');
+  assert.equal(chain[chain.length - 1], 'n19900');
+  assert.equal(chain[chain.length - 2], 'n19998');
+
+  // Every step of the reported chain must be a real successor edge or a
+  // real "runs after" dependency relation in the definition.
+  const successorEdges = new Set();
+  const dependencyEdges = new Set();
+  for (const node of workflow.nodes) {
+    const targets = node.type === 'condition' ? [node.then, node.else]
+      : node.type === 'end' ? []
+      : Array.isArray(node.next) ? node.next : [node.next];
+    for (const target of targets) successorEdges.add(`${node.id}->${target}`);
+    for (const dependency of node.dependsOn ?? []) dependencyEdges.add(`${dependency}->${node.id}`);
+  }
+  for (let i = 0; i < chain.length - 1; i += 1) {
+    const step = `${chain[i]}->${chain[i + 1]}`;
+    assert.ok(successorEdges.has(step) || dependencyEdges.has(step), `unrelated step in cycle chain: ${step}`);
+  }
+  assert.ok(dependencyEdges.has('n19998->n19900'));
+});
+
+test('multiple branches converging on one node is not a cycle', () => {
+  const converging = {
+    id: 'join', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: ['a', 'b'] },
+      { id: 'a', type: 'action', next: 'join' },
+      { id: 'b', type: 'action', next: 'join' },
+      { id: 'join', type: 'action', next: 'done' },
+      { id: 'done', type: 'end', result: 'done' },
+    ],
+  };
+  assert.doesNotThrow(() => validateWorkflow(converging));
+});
+
+test('a healthy entry section does not rescue a definition cycled elsewhere', () => {
+  const size = 1000;
+  const workflow = successorChainWorkflow(size);
+  workflow.id = 'partial-cycle';
+  // A disconnected component with its own two-node edge cycle.
+  workflow.nodes.push(
+    { id: 'lost1', type: 'action', next: 'lost2' },
+    { id: 'lost2', type: 'action', next: 'lost1' },
+  );
+  assert.throws(() => validateWorkflow(workflow), /cycle is present: lost1 -> lost2 -> lost1/);
+});
+
+test('sync and async runs reject a definition cycle before any node can run', async () => {
+  // The action names an operation that has no implementation; the cycle
+  // must still win over operation checks, business failures or dependency
+  // blocking, before a single node executes.
+  const cyclic = {
+    id: 'op-cycle', entry: 'a',
+    nodes: [
+      { id: 'a', type: 'trigger', next: 'b' },
+      { id: 'b', type: 'action', operation: 'charge', next: 'a' },
+    ],
+  };
+  assert.throws(() => executeWorkflow(cyclic), /cycle is present: a -> b -> a/);
+  await assert.rejects(executeWorkflowAsync(cyclic, {}, {}), /cycle is present: a -> b -> a/);
 });
 

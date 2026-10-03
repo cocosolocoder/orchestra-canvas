@@ -466,6 +466,13 @@ function normalizeDependencies(node, nodes, entryId) {
 // take and nodes the entry cannot reach. The error names a node id chain
 // whose first and last entries match and whose steps are real edges or
 // dependency relations.
+//
+// The search is an iterative three-color DFS with an explicit frame stack:
+// a recursive walk over a legal definition tens of thousands of chained
+// nodes deep would overflow the call stack before producing a result. `path`
+// holds the gray nodes in DFS order (what a recursive stack would hold) and
+// `depthById` locates a gray node in it, so a back edge still reports
+// exactly the cycle segment — never the entry path leading into it.
 function detectCycles(nodes) {
   const adjacency = new Map([...nodes.keys()].map(id => [id, []]));
   for (const [id, node] of nodes) {
@@ -475,22 +482,40 @@ function detectCycles(nodes) {
     }
   }
   const color = new Map([...nodes.keys()].map(id => [id, 'white']));
-  const stack = [];
-  const visit = id => {
-    color.set(id, 'gray');
-    stack.push(id);
-    for (const target of adjacency.get(id)) {
-      if (color.get(target) === 'gray') {
-        const chain = [...stack.slice(stack.indexOf(target)), target];
-        throw new Error(`cycle is present: ${chain.join(' -> ')}`);
+
+  for (const root of nodes.keys()) {
+    if (color.get(root) !== 'white') continue;
+    color.set(root, 'gray');
+    const path = [root];
+    const depthById = new Map([[root, 0]]);
+    // Each frame is [node id, index of the next outgoing edge to examine].
+    const frames = [[root, 0]];
+    while (frames.length > 0) {
+      const frame = frames[frames.length - 1];
+      const id = frame[0];
+      const edges = adjacency.get(id);
+      if (frame[1] < edges.length) {
+        const target = edges[frame[1]];
+        frame[1] += 1;
+        const targetColor = color.get(target);
+        if (targetColor === 'gray') {
+          const start = depthById.get(target);
+          const chain = [...path.slice(start), target];
+          throw new Error(`cycle is present: ${chain.join(' -> ')}`);
+        }
+        if (targetColor === 'white') {
+          color.set(target, 'gray');
+          depthById.set(target, path.length);
+          path.push(target);
+          frames.push([target, 0]);
+        }
+      } else {
+        frames.pop();
+        path.pop();
+        depthById.delete(id);
+        color.set(id, 'black');
       }
-      if (color.get(target) === 'white') visit(target);
     }
-    stack.pop();
-    color.set(id, 'black');
-  };
-  for (const id of nodes.keys()) {
-    if (color.get(id) === 'white') visit(id);
   }
 }
 
