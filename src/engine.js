@@ -760,27 +760,41 @@ function retryDelay(retry, failedAttempt) {
   return Math.min(grown, retry.maxDelayMs);
 }
 
-// Runs one business action with retries. Every invocation receives fresh
-// structured clones of the current input and the successful outputs so far;
-// mutations by a failed attempt are discarded, and the stored success value
-// is a clone independent of any object the implementation keeps holding.
+// Runs an operation under a retry policy — the one attempt loop shared by
+// business actions and compensations. Every invocation works on fresh
+// structured-clone argument copies produced by prepareArgs, so mutations by
+// a failed attempt are discarded before the next try; a thrown exception, a
+// rejected Promise, or a return value that cannot be structured-cloned all
+// count as a failed attempt, and the recorded success value is a clone
+// independent of any object the implementation keeps holding. Attempts are
+// numbered from 1, the wait after a failure follows the configured backoff
+// (zero stays zero, nothing is awaited after the last attempt), and each
+// actual invocation appends exactly one record, in order, via collect.
+//
+// The two callers differ only through the hooks:
+// - prepareArgs(attempt) builds this attempt's fresh argument copies;
+// - invoke is the registered implementation, called as invoke(...args);
+// - createRecord(attempt) shapes the record (business attempts carry no
+//   operation/result fields, compensation attempts do);
+// - cloneFailureMessage names the operation kind for uncloneable returns;
+// - collect appends to the caller's own attempt list;
+// - onSuccess stores caller-specific success data on the record.
 // When a cancellation signal is given, no new attempt starts once it has
 // fired — even with a zero retry delay — and a wait in progress ends early;
 // an attempt already running is always awaited and its outcome recorded.
-async function runBusinessAction(node, binding, implementation, context, actionAttempts, signal) {
-  const { retry } = binding;
+// Compensation passes no signal and is therefore never interrupted.
+async function runWithRetries({ retry, signal = null, prepareArgs, invoke, createRecord, cloneFailureMessage, collect, onSuccess }) {
   let lastReason = null;
 
   for (let attempt = 1; attempt <= retry.attempts; attempt += 1) {
     if (signal && signal.aborted) {
       return { ok: false, cancelled: true, error: lastReason };
     }
-    const inputCopy = structuredClone(context.input);
-    const outputCopy = structuredClone(context.output);
-    const record = { nodeId: node.id, attempt, ok: false, error: null, nextDelayMs: 0 };
+    const args = prepareArgs(attempt);
+    const record = createRecord(attempt);
     let returned;
     try {
-      returned = await implementation(inputCopy, outputCopy, node.id, attempt);
+      returned = await invoke(...args);
     } catch (error) {
       lastReason = describeError(error);
       record.error = lastReason;
@@ -790,14 +804,15 @@ async function runBusinessAction(node, binding, implementation, context, actionA
       try {
         returned = structuredClone(returned);
       } catch (error) {
-        lastReason = `operation "${binding.name}" returned a value that cannot be structured-cloned`;
+        lastReason = cloneFailureMessage;
         record.error = lastReason;
       }
     }
 
     if (record.error === null) {
       record.ok = true;
-      actionAttempts.push(record);
+      onSuccess(record, returned);
+      collect(record);
       return { ok: true, value: returned };
     }
 
@@ -805,12 +820,12 @@ async function runBusinessAction(node, binding, implementation, context, actionA
     // failure record but stops the retry loop: no wait, no next attempt —
     // even when this was the last attempt the run could have made.
     if (signal && signal.aborted) {
-      actionAttempts.push(record);
+      collect(record);
       return { ok: false, cancelled: true, error: lastReason };
     }
 
     record.nextDelayMs = attempt < retry.attempts ? retryDelay(retry, attempt) : 0;
-    actionAttempts.push(record);
+    collect(record);
     if (record.nextDelayMs > 0) {
       // A cancellation during the wait ends it immediately; the failed
       // attempt's record keeps its error but no longer promises a delay.
@@ -825,6 +840,24 @@ async function runBusinessAction(node, binding, implementation, context, actionA
   return { ok: false, error: lastReason };
 }
 
+// Runs one business action with retries. Every invocation receives fresh
+// structured clones of the current input and the successful outputs so far;
+// the stored success value is a clone independent of any object the
+// implementation keeps holding. The cancellation signal applies to this
+// loop only — compensation runs without one.
+async function runBusinessAction(node, binding, implementation, context, actionAttempts, signal) {
+  return runWithRetries({
+    retry: binding.retry,
+    signal,
+    prepareArgs: attempt => [structuredClone(context.input), structuredClone(context.output), node.id, attempt],
+    invoke: implementation,
+    createRecord: attempt => ({ nodeId: node.id, attempt, ok: false, error: null, nextDelayMs: 0 }),
+    cloneFailureMessage: `operation "${binding.name}" returned a value that cannot be structured-cloned`,
+    collect: record => actionAttempts.push(record),
+    onSuccess: () => {},
+  });
+}
+
 // Runs compensation for one already-succeeded business action. The call gets
 // independent structured clones of the input and earlier outputs captured at
 // the original action's success moment, the stored return value, the node id
@@ -832,47 +865,21 @@ async function runBusinessAction(node, binding, implementation, context, actionA
 // context, a later attempt, another run, or the stored success output.
 async function runCompensation(entry, implementation, records) {
   const { nodeId, binding, snapshot } = entry;
-  const { retry } = binding.compensation;
-  let lastReason = null;
-
-  for (let attempt = 1; attempt <= retry.attempts; attempt += 1) {
-    const inputCopy = structuredClone(snapshot.input);
-    const outputCopy = structuredClone(snapshot.output);
-    const resultCopy = structuredClone(snapshot.result);
-    const record = {
+  return runWithRetries({
+    retry: binding.compensation.retry,
+    prepareArgs: attempt => [
+      structuredClone(snapshot.input), structuredClone(snapshot.output),
+      structuredClone(snapshot.result), nodeId, attempt,
+    ],
+    invoke: implementation,
+    createRecord: attempt => ({
       nodeId, operation: binding.compensation.name, attempt,
       ok: false, error: null, nextDelayMs: 0, result: null,
-    };
-    let returned;
-    try {
-      returned = await implementation(inputCopy, outputCopy, resultCopy, nodeId, attempt);
-    } catch (error) {
-      lastReason = describeError(error);
-      record.error = lastReason;
-    }
-
-    if (record.error === null) {
-      try {
-        returned = structuredClone(returned);
-      } catch (error) {
-        lastReason = `compensation "${binding.compensation.name}" returned a value that cannot be structured-cloned`;
-        record.error = lastReason;
-      }
-    }
-
-    if (record.error === null) {
-      record.ok = true;
-      record.result = returned;
-      records.push(record);
-      return { ok: true, value: returned };
-    }
-
-    record.nextDelayMs = attempt < retry.attempts ? retryDelay(retry, attempt) : 0;
-    records.push(record);
-    if (record.nextDelayMs > 0) await sleep(record.nextDelayMs);
-  }
-
-  return { ok: false, error: lastReason };
+    }),
+    cloneFailureMessage: `compensation "${binding.compensation.name}" returned a value that cannot be structured-cloned`,
+    collect: record => records.push(record),
+    onSuccess: (record, returned) => { record.result = returned; },
+  });
 }
 
 // Undoes successful compensable business actions, most recent first, waiting
