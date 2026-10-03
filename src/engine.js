@@ -553,6 +553,23 @@ function lookupOwn(root, segments) {
   return { exists: true, value: current };
 }
 
+// Stores a successful action's result under its full node id. The id itself is
+// only matched as a whole string, so "__proto__" is a legal node identifier;
+// but a plain `output[id] = value` assignment invokes the inherited
+// Object.prototype.__proto__ setter and re-points the store's prototype
+// instead of creating an own property — the result then vanishes from hasOwn
+// checks, enumeration and JSON output. Define an own enumerable data property
+// for that key; reads and clones treat it like every other key.
+function setNodeOutput(output, nodeId, value) {
+  if (nodeId === '__proto__') {
+    Object.defineProperty(output, nodeId, {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+  } else {
+    output[nodeId] = value;
+  }
+}
+
 // Resolves an output reference against the run's saved outputs. Only outputs
 // of actions that succeeded in this run are present here — failed attempts
 // and compensation returns are recorded elsewhere. A referenced action that
@@ -895,7 +912,7 @@ function blockedResult(state) {
 // or null when execution should continue.
 function applyRegularNode(node, state) {
   if (node.type === 'action') {
-    state.context.output[node.id] = node.message ?? `action:${node.id}`;
+    setNodeOutput(state.context.output, node.id, node.message ?? `action:${node.id}`);
   }
   if (node.type === 'form') {
     const compiled = formSchemas.get(node);
@@ -1108,7 +1125,7 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
           output: structuredClone(state.context.output),
           result: structuredClone(actionResult.value),
         };
-        state.context.output[ready.id] = actionResult.value;
+        setNodeOutput(state.context.output, ready.id, actionResult.value);
         if (compensationSnapshot) {
           // Each node completes at most once, so retried-then-successful
           // actions and shared join nodes are scheduled for compensation

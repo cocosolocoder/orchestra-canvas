@@ -75,7 +75,7 @@ An output reference reads the value a successful action node stored in the run's
 { "nodeId": "risk-check", "path": "risk.score" }
 ```
 
-- `nodeId` is matched as a whole string (dots are literal characters, not path separators) and must name an `action` node in this workflow definition.
+- `nodeId` is matched as a whole string (dots are literal characters, not path separators) and must name an `action` node in this workflow definition. The segment restrictions below apply only to paths, not to node ids: an action may be named `__proto__` or `constructor`, and its result is saved and read under that exact name.
 - `path` is optional; when omitted the reference reads the action's entire return value. When present it follows the same segment rules as input paths (non-empty, no empty segments, no `__proto__` / `prototype` / `constructor`).
 
 At execution time a reference reads only outputs saved by actions that succeeded in this run — failed attempts and compensation returns are never read. An action that has not run, was never activated, or sits on an untaken branch is simply missing; a reference never activates an action, never waits for a future result, and adds no dependency. A path walks own properties level by level; encountering an array or a non-object parent value counts as missing, as does a missing property. A successfully saved `null`, `""`, `0`, `false`, or `undefined` is still present. The synchronous entry can reference message action outputs the same way.
