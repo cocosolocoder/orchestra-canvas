@@ -542,6 +542,22 @@ export function validateWorkflow(workflow) {
   return nodes;
 }
 
+// Stores a successful action result keyed by its node id. Node ids are
+// matched as whole strings and may legitimately be "__proto__"; assigning it
+// on a plain object would invoke the legacy __proto__ setter (replacing the
+// prototype) instead of creating an own property. Defining it as a data
+// property bypasses the setter, so every successful result is an own
+// enumerable value visible to hasOwn, key enumeration and JSON.stringify.
+function setOutputValue(output, nodeId, value) {
+  if (nodeId === '__proto__') {
+    Object.defineProperty(output, nodeId, {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+    return;
+  }
+  output[nodeId] = value;
+}
+
 function lookupOwn(root, segments) {
   let current = root;
   for (const part of segments) {
@@ -895,7 +911,7 @@ function blockedResult(state) {
 // or null when execution should continue.
 function applyRegularNode(node, state) {
   if (node.type === 'action') {
-    state.context.output[node.id] = node.message ?? `action:${node.id}`;
+    setOutputValue(state.context.output, node.id, node.message ?? `action:${node.id}`);
   }
   if (node.type === 'form') {
     const compiled = formSchemas.get(node);
@@ -1108,7 +1124,7 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
           output: structuredClone(state.context.output),
           result: structuredClone(actionResult.value),
         };
-        state.context.output[ready.id] = actionResult.value;
+        setOutputValue(state.context.output, ready.id, actionResult.value);
         if (compensationSnapshot) {
           // Each node completes at most once, so retried-then-successful
           // actions and shared join nodes are scheduled for compensation
