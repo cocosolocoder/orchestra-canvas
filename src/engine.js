@@ -720,9 +720,30 @@ function sleep(ms, signal) {
   });
 }
 
+// Recorded failure reasons are always strings. A normal Error keeps its
+// message verbatim — including an empty string, which still marks a failed
+// attempt. Thrown strings, numbers, booleans, null and undefined keep their
+// usual String() text. An Error whose message is not a string or cannot be
+// read without throwing, and any other value that resists text conversion,
+// is recorded with a fixed placeholder instead; describing a failure must
+// never throw, or the run itself would break off before retries and
+// compensation could happen. The original exception object is never mutated.
+const UNREADABLE_ERROR_MESSAGE = '无法读取异常信息';
+
 function describeError(error) {
-  if (error instanceof Error) return error.message;
-  return String(error);
+  if (error instanceof Error) {
+    try {
+      const message = error.message;
+      return typeof message === 'string' ? message : UNREADABLE_ERROR_MESSAGE;
+    } catch {
+      return UNREADABLE_ERROR_MESSAGE;
+    }
+  }
+  try {
+    return String(error);
+  } catch {
+    return UNREADABLE_ERROR_MESSAGE;
+  }
 }
 
 // Delay before the attempt following the given (failed) attempt number: the
