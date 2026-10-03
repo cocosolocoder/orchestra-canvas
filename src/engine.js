@@ -348,6 +348,26 @@ function compileRetry(config, label) {
   };
 }
 
+// A legacy `message` action (no operation) delivers its configured message as
+// the node's output. Objects and arrays must be structured-clonable: the
+// engine snapshots the message independently both at validation time and when
+// the action actually runs, so the stored output never shares an object with
+// the definition or with another run. A function (or a function, symbol, etc.
+// nested in an object/array) is a definition error naming the action node and
+// the reason. An unset, undefined or null message keeps the legacy
+// `action:<nodeId>` default; "", 0 and false pass through verbatim. A message
+// riding along on an operation action is never delivered or checked — the
+// operation's return value is that node's output, so an unused message there
+// cannot reject the definition.
+function compileLegacyMessage(node) {
+  if (!Object.hasOwn(node, 'message') || node.message === undefined) return;
+  try {
+    structuredClone(node.message);
+  } catch {
+    throw new Error(`action node ${node.id}: message must be a structured-cloneable value (objects and arrays must not contain functions)`);
+  }
+}
+
 // An action node either keeps the legacy `message` behavior, names a business
 // operation the caller supplies at run time, and/or declares a compensation
 // operation that undoes its business effect. Both retry blocks are optional
@@ -387,6 +407,11 @@ function compileAction(node) {
     }
     compensation = { name: config.operation, retry: compRetry };
   }
+
+  // Only a legacy message action (no operation) ever delivers its message, so
+  // only that shape's message is validated; an operation action's unused
+  // message configuration must not reject the workflow.
+  if (name === null) compileLegacyMessage(node);
 
   return { name, retry, compensation };
 }
@@ -1038,7 +1063,16 @@ function advanceSchedule(state) {
 // or null when execution should continue.
 function applyRegularNode(node, state) {
   if (node.type === 'action') {
-    setNodeOutput(state.context.output, node.id, node.message ?? `action:${node.id}`);
+    // Snapshot the message at this action's own execution moment (this path is
+    // reached only by legacy message actions — operation actions store their
+    // cloned return value in the asynchronous loop). The stored output is this
+    // run's independent copy: later mutation of the definition's message, of
+    // another run's output, or of the returned context cannot reach back here,
+    // and conditions later in the run read the value frozen at this moment.
+    // Validation already guarantees cloneability, so this cannot throw
+    // mid-run. Unset/undefined/null keep the `action:<id>` default; "", 0 and
+    // false pass through ?? and structuredClone untouched.
+    setNodeOutput(state.context.output, node.id, structuredClone(node.message ?? `action:${node.id}`));
   }
   if (node.type === 'form') {
     const compiled = formSchemas.get(node);
