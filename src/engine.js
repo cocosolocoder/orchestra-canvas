@@ -949,6 +949,39 @@ function blockedResult(state) {
   }));
 }
 
+// One shared scheduling step for the synchronous and asynchronous entries.
+// pickReadyNode already encodes activation plus dependency gating; this adds
+// the rules the two entries used to duplicate:
+// - a ready node is recorded in the trace the moment it enters execution, so
+//   waiting and never-activated nodes never appear in trace or output;
+// - an end node records its result and completes, but never stops the other
+//   activated branches — the caller simply loops again;
+// - with no ready node left, activated-but-waiting nodes classify the run as
+//   "blocked", a visited end node as "completed", and anything else is a
+//   structural cycle (validation rejects those before execution).
+// The terminal kinds are classifications only: each entry keeps building its
+// own result shape (the asynchronous one adds attempt and compensation
+// fields) so the public return values are unchanged.
+function advanceSchedule(state) {
+  const ready = pickReadyNode(state);
+  if (!ready) {
+    const waiting = blockedResult(state);
+    if (waiting) return { kind: 'blocked', waiting };
+    if (state.endReached) return { kind: 'completed' };
+    throw new Error('workflow did not terminate; a cycle is present');
+  }
+  state.trace.push({ nodeId: ready.id, type: ready.type });
+  if (ready.type === 'end') {
+    // Reaching an end node records the result but never stops other
+    // activated branches; the run completes once nothing can still run.
+    state.endReached = true;
+    state.endResult = ready.result ?? null;
+    state.completed.add(ready.id);
+    return { kind: 'end' };
+  }
+  return { kind: 'run', node: ready };
+}
+
 // Applies a ready non-action node, mutating activation/completion state.
 // Returns an early-termination result (invalid_input / invalid_condition)
 // or null when execution should continue.
@@ -1032,30 +1065,17 @@ export function executeWorkflow(workflow, input = {}) {
   const state = createRunState(nodes, workflow, input);
 
   for (;;) {
-    const ready = pickReadyNode(state);
+    const step = advanceSchedule(state);
 
-    if (!ready) {
-      const blockedNodes = blockedResult(state);
-      if (blockedNodes) {
-        return { status: 'blocked', context: state.context, trace: state.trace, blockedNodes };
-      }
-      if (state.endReached) {
-        return { status: 'completed', result: state.endResult, context: state.context, trace: state.trace };
-      }
-      throw new Error('workflow did not terminate; a cycle is present');
+    if (step.kind === 'blocked') {
+      return { status: 'blocked', context: state.context, trace: state.trace, blockedNodes: step.waiting };
     }
-
-    state.trace.push({ nodeId: ready.id, type: ready.type });
-    if (ready.type === 'end') {
-      // Reaching an end node records the result but never stops other
-      // activated branches; the run completes once nothing can still run.
-      state.endReached = true;
-      state.endResult = ready.result ?? null;
-      state.completed.add(ready.id);
-      continue;
+    if (step.kind === 'completed') {
+      return { status: 'completed', result: state.endResult, context: state.context, trace: state.trace };
     }
+    if (step.kind === 'end') continue;
 
-    const early = applyRegularNode(ready, state);
+    const early = applyRegularNode(step.node, state);
     if (early) return early;
   }
 }
@@ -1105,37 +1125,27 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
       return withCompensation(cancelledResult(state), state, operations);
     }
 
-    const ready = pickReadyNode(state);
+    const step = advanceSchedule(state);
 
-    if (!ready) {
-      const blockedNodes = blockedResult(state);
-      if (blockedNodes) {
-        // Unmet dependencies end the run; successful compensable actions are
-        // rolled back even though an end node may already have been reached.
-        return withCompensation({
-          status: 'blocked', context: state.context, trace: state.trace,
-          blockedNodes, actionAttempts: state.actionAttempts,
-        }, state, operations);
-      }
-      if (state.endReached) {
-        // A completed run never invokes compensation.
-        return {
-          status: 'completed', result: state.endResult, context: state.context,
-          trace: state.trace, actionAttempts: state.actionAttempts,
-          compensationStatus: 'not_needed', compensationAttempts: [],
-        };
-      }
-      throw new Error('workflow did not terminate; a cycle is present');
+    if (step.kind === 'blocked') {
+      // Unmet dependencies end the run; successful compensable actions are
+      // rolled back even though an end node may already have been reached.
+      return withCompensation({
+        status: 'blocked', context: state.context, trace: state.trace,
+        blockedNodes: step.waiting, actionAttempts: state.actionAttempts,
+      }, state, operations);
     }
-
-    state.trace.push({ nodeId: ready.id, type: ready.type });
-    if (ready.type === 'end') {
-      state.endReached = true;
-      state.endResult = ready.result ?? null;
-      state.completed.add(ready.id);
-      continue;
+    if (step.kind === 'completed') {
+      // A completed run never invokes compensation.
+      return {
+        status: 'completed', result: state.endResult, context: state.context,
+        trace: state.trace, actionAttempts: state.actionAttempts,
+        compensationStatus: 'not_needed', compensationAttempts: [],
+      };
     }
+    if (step.kind === 'end') continue;
 
+    const ready = step.node;
     if (ready.type === 'action') {
       const binding = actionBindings.get(ready);
       if (binding.name !== null) {
