@@ -726,13 +726,21 @@ const UNREADABLE_ERROR_MESSAGE = '无法读取异常信息';
 // attempt. An Error whose message is a readable string keeps it verbatim —
 // an empty string is still a failure — and thrown strings, numbers,
 // booleans, null and undefined keep their usual String() representation.
-// When the text cannot be read (a non-string message, a message getter that
-// throws, or a value String() cannot convert), a fixed placeholder is
-// recorded so the run result is never rejected; the original value is left
-// untouched. Both synchronous throws and rejected Promises reach this via
-// the same try/await.
+// When the text cannot be read — because identifying the value itself
+// throws (a revoked Proxy, or a proxy whose getPrototypeOf trap throws, both
+// of which make `instanceof` throw), because the message is not a string or
+// its getter throws, or because String() cannot convert the value — a fixed
+// placeholder is recorded so the run result is never rejected; the original
+// value is left untouched. Both synchronous throws and rejected Promises
+// reach this via the same try/await.
 function describeError(error) {
-  if (error instanceof Error) {
+  let isError;
+  try {
+    isError = error instanceof Error;
+  } catch {
+    return UNREADABLE_ERROR_MESSAGE;
+  }
+  if (isError) {
     let message;
     try {
       message = error.message;
