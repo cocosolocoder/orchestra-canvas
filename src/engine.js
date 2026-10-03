@@ -466,6 +466,12 @@ function normalizeDependencies(node, nodes, entryId) {
 // take and nodes the entry cannot reach. The error names a node id chain
 // whose first and last entries match and whose steps are real edges or
 // dependency relations.
+//
+// The DFS is driven by an explicit frame stack rather than recursion: a
+// legitimate definition can chain tens of thousands of nodes, and a recursive
+// walk would spend one call frame per node and overflow the call stack before
+// reaching a verdict. Frame order and edge order mirror a recursive walk, so
+// the first back edge found (and the node chain reported for it) is identical.
 function detectCycles(nodes) {
   const adjacency = new Map([...nodes.keys()].map(id => [id, []]));
   for (const [id, node] of nodes) {
@@ -475,22 +481,31 @@ function detectCycles(nodes) {
     }
   }
   const color = new Map([...nodes.keys()].map(id => [id, 'white']));
-  const stack = [];
-  const visit = id => {
-    color.set(id, 'gray');
-    stack.push(id);
-    for (const target of adjacency.get(id)) {
-      if (color.get(target) === 'gray') {
-        const chain = [...stack.slice(stack.indexOf(target)), target];
+  const frames = [];
+  for (const root of nodes.keys()) {
+    if (color.get(root) !== 'white') continue;
+    color.set(root, 'gray');
+    frames.push({ id: root, edges: adjacency.get(root), index: 0 });
+    while (frames.length > 0) {
+      const frame = frames[frames.length - 1];
+      if (frame.index >= frame.edges.length) {
+        color.set(frame.id, 'black');
+        frames.pop();
+        continue;
+      }
+      const target = frame.edges[frame.index];
+      frame.index += 1;
+      const targetColor = color.get(target);
+      if (targetColor === 'gray') {
+        const start = frames.findIndex(candidate => candidate.id === target);
+        const chain = [...frames.slice(start).map(candidate => candidate.id), target];
         throw new Error(`cycle is present: ${chain.join(' -> ')}`);
       }
-      if (color.get(target) === 'white') visit(target);
+      if (targetColor === 'white') {
+        color.set(target, 'gray');
+        frames.push({ id: target, edges: adjacency.get(target), index: 0 });
+      }
     }
-    stack.pop();
-    color.set(id, 'black');
-  };
-  for (const id of nodes.keys()) {
-    if (color.get(id) === 'white') visit(id);
   }
 }
 
