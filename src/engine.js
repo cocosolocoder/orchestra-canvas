@@ -731,8 +731,21 @@ const UNREADABLE_ERROR_MESSAGE = '无法读取异常信息';
 // recorded so the run result is never rejected; the original value is left
 // untouched. Both synchronous throws and rejected Promises reach this via
 // the same try/await.
+//
+// Recognition itself can fail: `instanceof` walks the prototype chain, and a
+// revoked Proxy (or one whose getPrototypeOf trap throws) makes it throw a
+// brand-new TypeError. That throw is not allowed to escape the attempt's
+// catch block — otherwise the run Promise rejects and failure handling is
+// skipped — so a failure at any of the three stages (recognition, message
+// read, text conversion) records the same fixed placeholder.
 function describeError(error) {
-  if (error instanceof Error) {
+  let isError = false;
+  try {
+    isError = error instanceof Error;
+  } catch {
+    return UNREADABLE_ERROR_MESSAGE;
+  }
+  if (isError) {
     let message;
     try {
       message = error.message;
