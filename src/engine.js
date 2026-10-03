@@ -391,6 +391,22 @@ function compileAction(node) {
   return { name, retry, compensation };
 }
 
+// An end node's result is delivered to the caller verbatim for primitives
+// (null, undefined, strings, numbers, booleans), but an object or array result
+// must be structured-clonable: the engine snapshots it independently both at
+// validation time and again when the end node actually runs. A function (or a
+// symbol, getter-built object the clone algorithm rejects, etc.) nested in a
+// result object/array is a definition error naming the end node and reason;
+// bare function results cannot be delivered through JSON-style results either.
+function compileEndResult(node) {
+  if (!Object.hasOwn(node, 'result') || node.result === undefined) return;
+  try {
+    structuredClone(node.result);
+  } catch {
+    throw new Error(`end node ${node.id}: result must be a structured-cloneable value (objects and arrays must not contain functions)`);
+  }
+}
+
 // Resolves the outgoing edges of a node. Trigger, form and action nodes may
 // name a single successor or a non-empty, duplicate-free array of successors;
 // conditions keep their then/else pair and end nodes have none.
@@ -553,6 +569,9 @@ export function validateWorkflow(workflow) {
     }
     if (node.type === 'action') {
       actionBindings.set(node, compileAction(node));
+    }
+    if (node.type === 'end') {
+      compileEndResult(node);
     }
   }
 
@@ -999,8 +1018,15 @@ function advanceSchedule(state) {
   if (ready.type === 'end') {
     // Reaching an end node records the result but never stops other
     // activated branches; the run completes once nothing can still run.
+    // Snapshot the result at this end node's own execution moment: the
+    // recorded value is this run's independent copy, so later mutation of
+    // the definition's result (during a wait on another activated branch),
+    // of another run's result, or of the returned value cannot reach back
+    // here. Validation already guarantees cloneability, so this cannot
+    // throw mid-run. An unset or null result stays null; 0, false and ""
+    // pass through ?? untouched (only null/undefined default to null).
     state.endReached = true;
-    state.endResult = ready.result ?? null;
+    state.endResult = structuredClone(ready.result ?? null);
     state.completed.add(ready.id);
     return { kind: 'end' };
   }
