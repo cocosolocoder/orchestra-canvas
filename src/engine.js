@@ -427,33 +427,96 @@ function compileAction(node) {
 
 // An end node's result is delivered to the caller verbatim for primitives
 // (null, undefined, strings, numbers, booleans), but an object or array result
-// must be structured-clonable: the engine snapshots it independently both at
-// validation time and again when the end node actually runs. A function (or a
-// symbol, getter-built object the clone algorithm rejects, etc.) nested in a
-// result object/array is a definition error naming the end node and reason;
-// bare function results cannot be delivered through JSON-style results either.
+// must be structured-clonable. The independent-copy promise is enforced at
+// BOTH moments it can be observed:
 //
-// Cloneability alone is not enough: structured cloning a SharedArrayBuffer (or
-// a typed array / DataView backed by one) "succeeds" while the clone keeps
-// sharing the underlying bytes with the definition's result, so the caller
-// could rewrite the returned bytes and silently change the definition and
-// every later run — the promised independent copy could not be delivered.
-// As with legacy messages, run inputs and operation returns, the clone is
-// therefore produced first and judged with containsSharedMemory: only shared
-// memory the clone actually retains condemns the result (an attached property
-// of a Date/RegExp, a non-enumerable or symbol-keyed property, an Error own
-// property other than cause are discarded by the clone and never inspected).
+//  1. At validation time (compileEndResult below), for every end node in the
+//     definition — including nodes on untaken branches and nodes the entry
+//     cannot reach — so a statically invalid result is rejected before any
+//     node can run.
+//  2. At the end node's own execution moment (captureEndResult), against the
+//     value actually about to be recorded: validation cannot see what an
+//     enumerable getter returns on its later read, nor what a preceding
+//     business operation or another activated branch does to the configured
+//     result before this end runs. Only the content this run will save is
+//     judged.
+//
+// The two failure kinds, in priority order: a value that cannot be
+// structured-cloned (a bare function, a function nested in an object/array, a
+// getter that throws, etc.), and a value that clones but whose clone retains
+// shared memory — cloning a SharedArrayBuffer (or a typed array / DataView
+// backed by one) "succeeds" while the clone keeps sharing the underlying
+// bytes, so the caller could rewrite the returned bytes and silently change
+// the definition and every later run. Uncloneability takes precedence when a
+// result carries both. As with legacy messages, run inputs and operation
+// returns, the clone is produced first and judged with containsSharedMemory:
+// only shared memory the clone actually retains condemns the result (an
+// attached property of a Date/RegExp, a non-enumerable or symbol-keyed
+// property, an Error own property other than cause are discarded by the clone
+// and never inspected).
+const END_RESULT_UNCLONEABLE_MESSAGE = nodeId =>
+  `end node ${nodeId}: result must be a structured-cloneable value (objects and arrays must not contain functions)`;
+const END_RESULT_SHARED_MEMORY_MESSAGE = nodeId =>
+  `end node ${nodeId}: result contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this end result is not supported`;
+
 function compileEndResult(node) {
   if (!Object.hasOwn(node, 'result') || node.result === undefined) return;
   let cloned;
   try {
     cloned = structuredClone(node.result);
   } catch {
-    throw new Error(`end node ${node.id}: result must be a structured-cloneable value (objects and arrays must not contain functions)`);
+    throw new Error(END_RESULT_UNCLONEABLE_MESSAGE(node.id));
   }
   if (containsSharedMemory(cloned)) {
-    throw new Error(`end node ${node.id}: result contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this end result is not supported`);
+    throw new Error(END_RESULT_SHARED_MEMORY_MESSAGE(node.id));
   }
+}
+
+// Reads the end node's configured result at the node's own execution moment
+// and produces the independent copy that will be recorded and returned. This
+// re-enforces, for exactly the content this run is about to save, the promise
+// validation already made for the value as it was then:
+//
+//   - the value is read exactly once here, via structuredClone's own read.
+//     There is no separate inspection pass over the original, so an
+//     enumerable getter's return order is never disturbed (the clone is the
+//     only read), and a getter that returned ordinary data during validation
+//     but returns shared memory — or a function — when this end executes is
+//     caught on the value that would actually have been saved;
+//   - shared memory the clone retains is rejected (containsSharedMemory runs
+//     on the clone), while shared memory placed only where cloning drops it
+//     is discarded with that property and never condemns an otherwise-legal
+//     result.
+//
+// Uncloneability takes precedence over shared memory, matching validation:
+// the clone is attempted first and its failure short-circuits before the
+// shared-memory traversal. An unset, undefined or null result still becomes
+// null (structuredClone(null) === null), while 0, false and "" pass through.
+//
+// Any failure is thrown here as an ordinary Error naming the end node rather
+// than recorded as a run status: the synchronous entry propagates it and the
+// asynchronous entry's rejected Promise carries it. It is never an
+// action_failed — the end node has no retry budget — and it neither consumes
+// business-action retries nor triggers compensation, and no "completed"
+// result is produced.
+function captureEndResult(node) {
+  let cloned;
+  try {
+    // `node.result ?? null` is the root value's single read (an unset,
+    // undefined or null result becomes null; 0, false and "" pass through);
+    // every nested enumerable accessor is read only by structuredClone, so
+    // this never adds a read that could change a getter's return order. A
+    // root getter that throws, a nested/root getter that throws while the
+    // clone reads it, and a value that cannot be cloned at all (a function)
+    // all surface as the same end-node result error.
+    cloned = structuredClone(node.result ?? null);
+  } catch {
+    throw new Error(END_RESULT_UNCLONEABLE_MESSAGE(node.id));
+  }
+  if (containsSharedMemory(cloned)) {
+    throw new Error(END_RESULT_SHARED_MEMORY_MESSAGE(node.id));
+  }
+  return cloned;
 }
 
 // Resolves the outgoing edges of a node. Trigger, form and action nodes may
@@ -1365,16 +1428,27 @@ function advanceSchedule(state) {
   if (ready.type === 'end') {
     // Reaching an end node records the result but never stops other
     // activated branches; the run completes once nothing can still run.
-    // Snapshot the result at this end node's own execution moment: the
-    // recorded value is this run's independent copy, so later mutation of
-    // the definition's result (during a wait on another activated branch),
-    // of another run's result, or of the returned value cannot reach back
-    // here. Validation already guarantees cloneability and that the clone
-    // retains no shared memory, so this cannot throw mid-run. An unset or
-    // null result stays null; 0, false and "" pass through ?? untouched
-    // (only null/undefined default to null).
+    // Produce the independent snapshot at THIS end node's own execution
+    // moment from the value actually read now: later mutation of the
+    // definition's result (during a wait on another activated branch), of
+    // another run's result, or of the returned value cannot reach back
+    // here. Validation only proves the result was cloneable — and free of
+    // retained shared memory — as it was then; an enumerable getter may
+    // answer differently on this, its only execution-time read, and a
+    // preceding business operation may have replaced ordinary buffers with
+    // shared ones (or vice versa). The success is therefore recorded only
+    // if this read's clone is independently copyable. captureEndResult
+    // throws the end-result error (uncloneable, or retained shared memory)
+    // here: the synchronous entry propagates it and the asynchronous
+    // entry's Promise rejects with it — never a "completed" result, never
+    // an action_failed (no retry budget is spent) and no compensation runs.
+    // An unset or null result stays null; 0, false and "" pass through.
+    // Capture first: if the value read now cannot be independently copied,
+    // the throw leaves no partially-recorded end behind (the whole run is
+    // rejected, sync throw / async rejection, before endReached is set).
+    const result = captureEndResult(ready);
     state.endReached = true;
-    state.endResult = structuredClone(ready.result ?? null);
+    state.endResult = result;
     state.completed.add(ready.id);
     return { kind: 'end' };
   }
