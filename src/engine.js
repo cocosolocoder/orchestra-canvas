@@ -1232,16 +1232,48 @@ async function compensateRun(state, operations) {
   return { status: failed ? 'failed' : 'completed', attempts: records };
 }
 
+// Produces the run's independent copy of the caller's input and rejects shared
+// memory before any node executes. structuredClone of a SharedArrayBuffer — or
+// of a typed array / DataView backed by one — "succeeds", but the clone keeps
+// sharing the underlying bytes with the object the caller holds: a business
+// action mutating the input copy it receives would then change the caller's
+// data, and a later attempt could read bytes an earlier attempt rewrote. No
+// independent copy is possible, so the run must fail to even receive its
+// input.
+//
+// The input is cloned first and the clone — exactly the content the run would
+// actually retain — is judged with containsSharedMemory (the same traversal
+// used for operation return values). Judging the clone means:
+// - an enumerable getter is read only by the clone's own single read, and the
+//   check sees precisely the value that was retained;
+// - a Map/Set's real internal members are inspected, so a custom
+//   Symbol.iterator cannot hide shared members or fabricate them;
+// - shared memory placed only where cloning drops it (attached own properties
+//   of a Date/RegExp/byte view, symbol-keyed or non-enumerable properties,
+//   Error own properties other than "cause") is discarded with the property
+//   and never condemns the otherwise-legal data.
+// A value structuredClone cannot carry at all (a function, etc.) surfaces as
+// its normal clone error, unchanged from the previous behavior.
+function cloneRunInput(input) {
+  const cloned = structuredClone(input);
+  if (containsSharedMemory(cloned)) {
+    throw new TypeError('run input contains shared memory (a SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so the run cannot receive this input');
+  }
+  return cloned;
+}
+
 // Scheduling state shared by the synchronous and asynchronous execution
 // loops: activation, completion, dependency gating and the recorded end
-// result all behave identically; only business-action handling differs.
+// result all behave identically; only business-action handling differs. The
+// input is the run's already-cloned, shared-memory-free copy, produced once by
+// cloneRunInput before scheduling begins.
 function createRunState(nodes, workflow, input) {
   const declarationOrder = [...nodes.values()];
   const declarationIndex = new Map(declarationOrder.map((node, index) => [node.id, index]));
   return {
     trace: [],
     actionAttempts: [],
-    context: { input: structuredClone(input), output: {} },
+    context: { input, output: {} },
     declarationOrder,
     declarationIndex,
     activated: new Set([workflow.entry]),
@@ -1404,7 +1436,12 @@ export function executeWorkflow(workflow, input = {}) {
     }
   }
 
-  const state = createRunState(nodes, workflow, input);
+  // Definition and business-operation checks above come first; only once they
+  // pass is the input received. Shared memory is rejected as a TypeError
+  // before a single node executes — never as an action_failed result.
+  const clonedInput = cloneRunInput(input);
+
+  const state = createRunState(nodes, workflow, clonedInput);
 
   for (;;) {
     const step = advanceSchedule(state);
@@ -1450,7 +1487,15 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
   const nodes = validateWorkflow(workflow);
   verifyOperations(nodes, operations);
 
-  const state = createRunState(nodes, workflow, input);
+  // The input is received only after the definition and every operation
+  // registration check above have passed — but before the already-aborted
+  // signal is honored, so even a run cancelled before it starts rejects input
+  // that retains shared memory. The rejection propagates as the returned
+  // promise's TypeError; no business or compensation operation is invoked and
+  // no action_failed result is produced.
+  const clonedInput = cloneRunInput(input);
+
+  const state = createRunState(nodes, workflow, clonedInput);
 
   // A signal that is already aborted stops the run before the first node —
   // but only after the definition and the operation registrations above have
