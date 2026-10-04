@@ -132,9 +132,25 @@ An implementation is called as `operation(input, output, nodeId, attempt)`:
 - `input` — an independent structured clone of the run's current input.
 - `output` — an independent structured clone of every earlier successful node output.
 - `nodeId` — the running node's id; `attempt` starts at `1`.
-- it may return a value or a Promise; the resolved value is structured-cloned and stored as that node's output, so later mutation of an object the implementation keeps cannot touch the run.
+- it may return a value or a Promise; the resolved value is structured-cloned and stored as that node's output, so later mutation of an object the implementation keeps cannot touch the run. A return value that contains shared memory is not supported (see below) and fails the attempt.
 
-Mutations made to the copies during a failed attempt never reach later attempts or the run context. A thrown exception, a rejected Promise, or a return value that cannot be structured-cloned all count as a failed attempt. The original caller input, the workflow definition, and other runs are never mutated.
+Mutations made to the copies during a failed attempt never reach later attempts or the run context. A thrown exception, a rejected Promise, a return value that cannot be structured-cloned, or a return value containing shared memory all count as a failed attempt. The original caller input, the workflow definition, and other runs are never mutated.
+
+### Return values containing shared memory
+
+Every saved output is promised to be an independent copy. A `SharedArrayBuffer` cannot satisfy that promise: structured cloning it (or a typed array / `DataView` backed by it) "succeeds", but the clone keeps **sharing the underlying bytes** with the object the implementation holds — bytes the implementation rewrites later would silently change the already saved node output. Such a return value is therefore explicitly unsupported and fails the attempt, regardless of whether it is returned synchronously or through a Promise.
+
+The attempt fails whenever the value that would be saved contains shared memory anywhere in it:
+
+- a `SharedArrayBuffer` returned directly;
+- a typed array (`Int8Array` … `BigUint64Array`, including `Uint8Array`) or a `DataView` whose buffer is a `SharedArrayBuffer`;
+- shared memory nested inside a plain object or array;
+- a `SharedArrayBuffer` (or a view over one) used as a `Map` key or value, or as a `Set` member;
+- shared memory carried in an `Error`'s `cause`.
+
+The failure follows the node's existing retry configuration: it uses the same attempt count, delays and backoff as a thrown exception, and every failed attempt is recorded in `actionAttempts` with an error stating that the return value contains shared memory and that isolation cannot be guaranteed. If a later attempt returns an ordinary cloneable value, the action succeeds normally and its output comes solely from that successful return. Once the attempts are exhausted the run ends `action_failed` exactly as for any other failure — prior input, successful outputs, the trace and attempt records are preserved, the failed node stores no output, no successor runs, and earlier successful actions that declared a compensation are compensated under the usual rules.
+
+Ordinary values are unaffected: a plain `ArrayBuffer` and views over one are copied byte-for-byte and accepted, as are `Date`, `Map`, `Set`, plain objects, arrays and primitives. Circular references, repeated references and in-container object relationships in legal return values are preserved; results merely containing byte arrays are not rejected. Operation call signatures and the shape of attempt/result records are unchanged.
 
 Retry configuration (`retry`) is either omitted — exactly one attempt — or present with all four fields:
 
@@ -189,9 +205,9 @@ A compensation implementation is called as `compensation(input, output, result, 
 - `output` — an independent structured clone of every earlier successful node output as of that moment; the action's own output key is not included.
 - `result` — an independent structured clone of the value the original action returned.
 - `nodeId` — the original node's id; `attempt` starts at `1` for each node's compensation.
-- it may return a value or a Promise; the resolved value is structured-cloned and recorded, so later mutation of an object the implementation keeps cannot change the record.
+- it may return a value or a Promise; the resolved value is structured-cloned and recorded, so later mutation of an object the implementation keeps cannot change the record. As with business operations, a return value containing shared memory (a `SharedArrayBuffer`, or a typed array/`DataView` backed by one, anywhere in the value) is unsupported and fails the attempt.
 
-A thrown exception, a rejected Promise, or a return value that cannot be structured-cloned all fail the attempt. Every argument is a fresh copy: compensation mutations cannot affect the original run records (successful outputs are never deleted or overwritten), later attempts, or other runs, and later form defaults never leak into the captured snapshots. Each compensation uses its own retry count and backoff settings; after its retries are exhausted the engine still compensates every earlier action. Neither a failed compensation nor the original business operation is ever invoked again.
+A thrown exception, a rejected Promise, a return value that cannot be structured-cloned, or a return value containing shared memory all fail the attempt. Every argument is a fresh copy: compensation mutations cannot affect the original run records (successful outputs are never deleted or overwritten), later attempts, or other runs, and later form defaults never leak into the captured snapshots. A failed shared-memory return is never recorded as a `result`. Each compensation uses its own retry count and backoff settings; after its retries are exhausted the engine still compensates every earlier action. Neither a failed compensation nor the original business operation is ever invoked again; the run keeps its original terminal status and failure reason, with `compensationStatus: "failed"` reported in the usual way.
 
 Every `executeWorkflowAsync` result also carries:
 
@@ -232,7 +248,7 @@ The result carries the `context`, `trace`, `actionAttempts`, `compensationStatus
 
 - **Already aborted at start** — the definition and the business/compensation operation registration checks still run first and report problems as usual. If they pass, the run returns `cancelled` with an empty trace and empty attempt records, an independent copy of the input, and `compensationStatus: "not_needed"`, without invoking any business or compensation operation.
 - **During a retry wait** — the wait ends immediately and no further attempt is made. The failed attempt's record keeps its error, and its `nextDelayMs` becomes `0`.
-- **While an operation is in flight** — the running call is awaited, never interrupted, and its arguments are unchanged. A success (with a structured-cloneable value) stores the output, records the success and is scheduled for compensation; a throw, rejection or uncloneable return keeps the failure record, stores no output and is not retried. If the signal had fired before that outcome was processed, the run ends `cancelled` — even when the failure was the last allowed attempt.
+- **While an operation is in flight** — the running call is awaited, never interrupted, and its arguments are unchanged. A success (with a supported, structured-cloneable value) stores the output, records the success and is scheduled for compensation; a throw, rejection, uncloneable return or shared-memory return keeps the failure record, stores no output and is not retried. If the signal had fired before that outcome was processed, the run ends `cancelled` — even when the failure was the last allowed attempt.
 - **Compensation after cancellation** follows the usual rules: successful actions that declared a compensation are undone in reverse success order with their success-moment snapshots and compensation retry configs, a failed compensation never stops earlier ones, and the result returns only after all of them finish. Further cancellation during compensation neither interrupts it nor causes duplicate calls, and successful outputs are never deleted. With nothing to compensate, `compensationStatus` is `not_needed`.
 - A run that already visited `end` but still has unfinished activated branches can still be cancelled. A cancellation that arrives only after the terminal state was determined — including while a failure's compensation is still running — never rewrites that result.
 

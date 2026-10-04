@@ -1,3 +1,5 @@
+import { types as nodeTypes } from 'node:util';
+
 const NODE_TYPES = new Set(['trigger', 'form', 'condition', 'action', 'end']);
 const FIELD_TYPES = new Set(['string', 'number', 'integer', 'boolean']);
 const FORBIDDEN_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
@@ -828,16 +830,196 @@ function retryDelay(retry, failedAttempt) {
   return Math.min(grown, retry.maxDelayMs);
 }
 
+// Canonical "buffer" getters bound to the real internal slot. An own
+// "buffer" property can be defined on a typed array / DataView to shadow the
+// prototype accessor with a plain ArrayBuffer while the object still keeps
+// shared bytes in its slot — so the backing buffer must always be read through
+// these getters, never through a plain `view.buffer` property access.
+const TypedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const TYPED_ARRAY_BUFFER_GETTER = Object.getOwnPropertyDescriptor(TypedArrayPrototype, 'buffer').get;
+const DATAVIEW_BUFFER_GETTER = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer').get;
+
+// A structured clone of a SharedArrayBuffer — or of a typed array / DataView
+// backed by one — succeeds, but the clone keeps sharing the underlying bytes
+// with the object the operation implementation holds: mutating those bytes
+// later would mutate the value the engine saved, breaking the promise that
+// every saved output is an independent copy. Such a return value is therefore
+// explicitly unsupported and fails the attempt.
+//
+// This walks exactly the graph the structured clone algorithm would traverse
+// (string-keyed own enumerable properties of plain objects and arrays —
+// including non-index properties on arrays — Map keys and values, Set members,
+// and Error "cause"), so the rejection is consistent wherever the shared
+// memory sits: a bare SharedArrayBuffer, a byte view over one, or bytes nested
+// inside objects, arrays, Maps (key or value) or Sets. A plain ArrayBuffer and
+// its views are accepted; circular and repeated references are visited once
+// via the same identity set the clone would use, so legal graphs' reference
+// relationships are unaffected by the check itself.
+//
+// Classification uses Node's internal-slot brand checks (util.types): they
+// recognize buffers, views, containers and errors constructed in another realm
+// and reject objects merely faking the right @@toStringTag, which tag matching
+// alone could not. Every possibly observable access is still guarded: a return
+// value that throws while inspected (a revoked proxy, a trap/getter that
+// throws) yields only the edges that could be read, and the structuredClone
+// step that follows reports it in the usual way — this check never throws.
+function containsSharedMemory(value) {
+  let rootIsObject;
+  try {
+    rootIsObject = value !== null && typeof value === 'object';
+  } catch {
+    // Even `typeof` can throw for a revoked proxy; structuredClone will reject
+    // it on its own in the caller.
+    return false;
+  }
+  if (!rootIsObject) return false;
+
+  const seen = new Set();
+  const stack = [];
+
+  const pushIfObject = child => {
+    let isObject;
+    try {
+      isObject = child !== null && typeof child === 'object';
+    } catch {
+      return;
+    }
+    if (isObject && !seen.has(child)) {
+      seen.add(child);
+      stack.push(child);
+    }
+  };
+  const read = (object, property) => {
+    try {
+      return [true, object[property]];
+    } catch {
+      return [false];
+    }
+  };
+
+  seen.add(value);
+  stack.push(value);
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+
+    if (nodeTypes.isSharedArrayBuffer(current)) return true;
+    if (nodeTypes.isArrayBuffer(current)) {
+      // A plain ArrayBuffer is copied byte-for-byte. Own properties attached
+      // to it are dropped by the clone anyway, so nothing needs traversal.
+      continue;
+    }
+    if (nodeTypes.isTypedArray(current)) {
+      // A typed array (Int8Array … BigUint64Array): the clone copies only the
+      // bytes of the view's backing buffer — custom own properties on the
+      // view are dropped. Read the true internal slot, since an own "buffer"
+      // property could otherwise shadow it with a plain ArrayBuffer.
+      let buffer = null;
+      try {
+        buffer = TYPED_ARRAY_BUFFER_GETTER.call(current);
+      } catch {
+        buffer = null;
+      }
+      if (buffer !== null && nodeTypes.isSharedArrayBuffer(buffer)) return true;
+      continue;
+    }
+    if (nodeTypes.isDataView(current)) {
+      let buffer = null;
+      try {
+        buffer = DATAVIEW_BUFFER_GETTER.call(current);
+      } catch {
+        buffer = null;
+      }
+      if (buffer !== null && nodeTypes.isSharedArrayBuffer(buffer)) return true;
+      continue;
+    }
+
+    if (Array.isArray(current)) {
+      // Indexed slots plus enumerable own string-keyed non-index properties,
+      // exactly as structuredClone treats arrays.
+      let keys;
+      try {
+        keys = Reflect.ownKeys(current);
+      } catch {
+        keys = [];
+      }
+      for (const key of keys) {
+        if (typeof key !== 'string') continue;
+        const [exists, child] = read(current, key);
+        if (exists) pushIfObject(child);
+      }
+      continue;
+    }
+
+    if (nodeTypes.isMap(current)) {
+      try {
+        for (const [key, child] of current) {
+          pushIfObject(key);
+          pushIfObject(child);
+        }
+      } catch {
+        // An unreadable iterator exposes nothing else to inspect.
+      }
+      continue;
+    }
+    if (nodeTypes.isSet(current)) {
+      try {
+        for (const member of current) pushIfObject(member);
+      } catch {
+        // Ignore an unreadable iterator.
+      }
+      continue;
+    }
+    if (nodeTypes.isNativeError(current)) {
+      // Only "cause" survives an Error clone (message/name/stack are copied
+      // as primitives; other own properties are dropped), so it alone needs
+      // traversal — including when it is non-enumerable.
+      let present;
+      try {
+        present = Object.hasOwn(current, 'cause');
+      } catch {
+        present = false;
+      }
+      if (present) {
+        const [, child] = read(current, 'cause');
+        pushIfObject(child);
+      }
+      continue;
+    }
+
+    // Plain objects (any prototype), Date, RegExp and other
+    // structured-cloneable leaf objects: only own enumerable string-keyed
+    // properties participate in the clone. Symbol-keyed and non-enumerable
+    // properties are skipped exactly as structuredClone skips them.
+    let keys;
+    try {
+      keys = Object.keys(current);
+    } catch {
+      continue;
+    }
+    for (const key of keys) {
+      const [exists, child] = read(current, key);
+      if (exists) pushIfObject(child);
+    }
+  }
+  return false;
+}
+
 // Runs an operation under a retry policy — the one attempt loop shared by
 // business actions and compensations. Every invocation works on fresh
 // structured-clone argument copies produced by prepareArgs, so mutations by
 // a failed attempt are discarded before the next try; a thrown exception, a
-// rejected Promise, or a return value that cannot be structured-cloned all
-// count as a failed attempt, and the recorded success value is a clone
-// independent of any object the implementation keeps holding. Attempts are
-// numbered from 1, the wait after a failure follows the configured backoff
-// (zero stays zero, nothing is awaited after the last attempt), and each
-// actual invocation appends exactly one record, in order, via collect.
+// rejected Promise, a return value carrying shared memory (a
+// SharedArrayBuffer or a byte view over one, anywhere in the saved graph),
+// or a return value that cannot be structured-cloned all count as a failed
+// attempt. Shared memory is rejected explicitly: cloning it "succeeds" but
+// keeps sharing the underlying bytes with an object the implementation can
+// still mutate, so no independent saved copy is possible. On success the
+// recorded value is a clone independent of any object the implementation
+// keeps holding. Attempts are numbered from 1, the wait after a failure
+// follows the configured backoff (zero stays zero, nothing is awaited after
+// the last attempt), and each actual invocation appends exactly one record,
+// in order, via collect.
 //
 // The two callers differ only through the hooks:
 // - prepareArgs(attempt) builds this attempt's fresh argument copies;
@@ -845,13 +1027,18 @@ function retryDelay(retry, failedAttempt) {
 // - createRecord(attempt) shapes the record (business attempts carry no
 //   operation/result fields, compensation attempts do);
 // - cloneFailureMessage names the operation kind for uncloneable returns;
+// - sharedMemoryFailureMessage names it for returns that contain shared
+//   memory, which cannot be isolated even though they clone;
 // - collect appends to the caller's own attempt list;
 // - onSuccess stores caller-specific success data on the record.
 // When a cancellation signal is given, no new attempt starts once it has
 // fired — even with a zero retry delay — and a wait in progress ends early;
 // an attempt already running is always awaited and its outcome recorded.
 // Compensation passes no signal and is therefore never interrupted.
-async function runWithRetries({ retry, signal = null, prepareArgs, invoke, createRecord, cloneFailureMessage, collect, onSuccess }) {
+async function runWithRetries({
+  retry, signal = null, prepareArgs, invoke, createRecord,
+  cloneFailureMessage, sharedMemoryFailureMessage, collect, onSuccess,
+}) {
   let lastReason = null;
 
   for (let attempt = 1; attempt <= retry.attempts; attempt += 1) {
@@ -865,6 +1052,11 @@ async function runWithRetries({ retry, signal = null, prepareArgs, invoke, creat
       returned = await invoke(...args);
     } catch (error) {
       lastReason = describeError(error);
+      record.error = lastReason;
+    }
+
+    if (record.error === null && containsSharedMemory(returned)) {
+      lastReason = sharedMemoryFailureMessage;
       record.error = lastReason;
     }
 
@@ -921,6 +1113,7 @@ async function runBusinessAction(node, binding, implementation, context, actionA
     invoke: implementation,
     createRecord: attempt => ({ nodeId: node.id, attempt, ok: false, error: null, nextDelayMs: 0 }),
     cloneFailureMessage: `operation "${binding.name}" returned a value that cannot be structured-cloned`,
+    sharedMemoryFailureMessage: `operation "${binding.name}" returned a value that contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this return value is not supported`,
     collect: record => actionAttempts.push(record),
     onSuccess: () => {},
   });
@@ -945,6 +1138,7 @@ async function runCompensation(entry, implementation, records) {
       ok: false, error: null, nextDelayMs: 0, result: null,
     }),
     cloneFailureMessage: `compensation "${binding.compensation.name}" returned a value that cannot be structured-cloned`,
+    sharedMemoryFailureMessage: `compensation "${binding.compensation.name}" returned a value that contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this return value is not supported`,
     collect: record => records.push(record),
     onSuccess: (record, returned) => { record.result = returned; },
   });
