@@ -398,11 +398,28 @@ function compileAction(node) {
   // untaken branches and entry-unreachable ones. An action that names an
   // operation ignores its message entirely, so an unused uncloneable message
   // is never rejected for it.
+  //
+  // The same holds for shared memory: cloning a SharedArrayBuffer (or a
+  // typed array / DataView backed by one) "succeeds" but the snapshot keeps
+  // sharing the underlying bytes with the definition's message, so rewriting
+  // the saved output's bytes would rewrite the definition itself — the
+  // independent-copy promise cannot be kept. The check judges the clone, not
+  // the original message, so exactly the content a run would save is
+  // inspected: shared memory nested in objects, arrays, Map keys or values,
+  // Set members or an Error cause (cycles included) is rejected, while
+  // shared memory carried only where cloning drops it (Date/RegExp attached
+  // properties, non-enumerable or symbol-keyed properties) is discarded
+  // along with those properties and stays legal. Plain ArrayBuffers and
+  // their views clone byte-for-byte into independent copies and are fine.
   if (name === null && Object.hasOwn(node, 'message') && node.message !== undefined) {
+    let snapshot;
     try {
-      structuredClone(node.message);
+      snapshot = structuredClone(node.message);
     } catch {
       throw new Error(`action node ${node.id}: message must be a structured-cloneable value (objects and arrays must not contain functions)`);
+    }
+    if (containsSharedMemory(snapshot)) {
+      throw new Error(`action node ${node.id}: message contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this message is not supported`);
     }
   }
 
