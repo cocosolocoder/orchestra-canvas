@@ -398,11 +398,27 @@ function compileAction(node) {
   // untaken branches and entry-unreachable ones. An action that names an
   // operation ignores its message entirely, so an unused uncloneable message
   // is never rejected for it.
+  //
+  // A value that clones but whose clone retains shared memory is rejected for
+  // the same reason the run input and operation return values are: cloning a
+  // SharedArrayBuffer (or a typed array / DataView backed by one) "succeeds"
+  // while the clone keeps sharing the underlying bytes, so the independent
+  // output copy the action promises — including against the definition's own
+  // message, which the engine clones again at execution time — could not be
+  // guaranteed. The check therefore runs on the cloned value with the same
+  // clone-shaped traversal (containsSharedMemory): shared memory placed only
+  // where cloning drops it (an attached property of a Date/RegExp, a
+  // non-enumerable property, an Error own property other than cause) is
+  // discarded with that property and never condemns the message.
   if (name === null && Object.hasOwn(node, 'message') && node.message !== undefined) {
+    let cloned;
     try {
-      structuredClone(node.message);
+      cloned = structuredClone(node.message);
     } catch {
       throw new Error(`action node ${node.id}: message must be a structured-cloneable value (objects and arrays must not contain functions)`);
+    }
+    if (containsSharedMemory(cloned)) {
+      throw new Error(`action node ${node.id}: message contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so shared bytes must not enter the action output`);
     }
   }
 
