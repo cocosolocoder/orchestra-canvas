@@ -1066,6 +1066,35 @@ function containsSharedMemory(value) {
   return false;
 }
 
+// Receives the caller's run input: structured-clone it once and judge that
+// clone, exactly as runWithRetries does for operation return values. The run
+// input is promised to every node — and to every business attempt and
+// compensation snapshot — as an independent copy, and a SharedArrayBuffer
+// cannot satisfy that promise: cloning it (or a typed array / DataView backed
+// by one) "succeeds" while the clone keeps sharing the underlying bytes with
+// the object the caller holds, so a business action that rewrites its input
+// copy could mutate the caller's data, and a failed attempt's rewrite would
+// leak into the next attempt and later retries. An input whose clone actually
+// retains shared memory is therefore rejected before any node can run — a
+// TypeError (the synchronous entry throws it; the asynchronous entry rejects
+// with the same error) explaining that the run input contains shared memory
+// and independent copies cannot be guaranteed. The judgment runs on the
+// clone, so the same rules as return values hold: an enumerable getter is read
+// exactly once (by the clone's own read), a custom Map/Set iterator cannot
+// hide real members or fabricate shared ones, and shared memory placed only
+// where cloning drops it (Date/RegExp attached properties, non-enumerable or
+// symbol-keyed properties, Error own properties other than cause) never
+// condemns otherwise-legal data.
+const RUN_INPUT_SHARED_MEMORY_MESSAGE = 'run input contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this run cannot be started';
+
+function cloneRunInput(input) {
+  const cloned = structuredClone(input);
+  if (containsSharedMemory(cloned)) {
+    throw new TypeError(RUN_INPUT_SHARED_MEMORY_MESSAGE);
+  }
+  return cloned;
+}
+
 // Runs an operation under a retry policy — the one attempt loop shared by
 // business actions and compensations. Every invocation works on fresh
 // structured-clone argument copies produced by prepareArgs, so mutations by
@@ -1235,13 +1264,20 @@ async function compensateRun(state, operations) {
 // Scheduling state shared by the synchronous and asynchronous execution
 // loops: activation, completion, dependency gating and the recorded end
 // result all behave identically; only business-action handling differs.
+//
+// The caller input is received — cloned and checked for retained shared
+// memory — here, the single point every entry passes through before any node
+// can run. Both entries call this after the definition, cancellation-option
+// and operation-registration checks but (for the asynchronous entry) before
+// the already-aborted-at-start short-circuit, so a shared-memory input is
+// rejected with a TypeError even when the signal has already fired.
 function createRunState(nodes, workflow, input) {
   const declarationOrder = [...nodes.values()];
   const declarationIndex = new Map(declarationOrder.map((node, index) => [node.id, index]));
   return {
     trace: [],
     actionAttempts: [],
-    context: { input: structuredClone(input), output: {} },
+    context: { input: cloneRunInput(input), output: {} },
     declarationOrder,
     declarationIndex,
     activated: new Set([workflow.entry]),
