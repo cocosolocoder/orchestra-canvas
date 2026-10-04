@@ -711,3 +711,276 @@ test('structured legal end results preserve types, bytes and circular/repeated r
   assert.equal(workflow.nodes[1].result, result);
   assert.equal(workflow.nodes[1].result.bytes, bytes);
 });
+
+// ---------------------------------------------------------------------------
+// The independent-copy promise is re-established at the end node's own
+// execution moment. Validation only reads the configured result once; the
+// value the end node actually reads later can differ — an enumerable getter
+// can change its answer, and an earlier asynchronous business operation can
+// mutate the shared workflow definition — so only content the execution-time
+// clone independently copies may be recorded as a successful result.
+// ---------------------------------------------------------------------------
+
+test('an enumerable getter that returns shared memory on the execution-time read rejects the synchronous run', () => {
+  let reads = 0;
+  const flips = {
+    get bytes() {
+      reads += 1;
+      return reads === 1 ? new Uint8Array([1, 2]) : new Uint8Array(new SharedArrayBuffer(4));
+    },
+  };
+  const workflow = linearEndWorkflow(flips);
+  // Validation accepted the ordinary value the getter returned the first
+  // time, and read it exactly once.
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+  assert.equal(reads, 1);
+
+  assert.throws(
+    () => executeWorkflow(workflow, {}),
+    error => {
+      assertEndSharedMemoryError(error);
+      return true;
+    },
+  );
+  // The execution-time clone is the only extra read: it must not traverse
+  // the original a second time or otherwise change the getter's order.
+  assert.equal(reads, 2);
+});
+
+test('the asynchronous entry rejects (never completes) when a getter answers shared memory at execution', async () => {
+  let reads = 0;
+  const flips = {
+    get view() {
+      reads += 1;
+      return reads === 1 ? 'ordinary' : new DataView(new SharedArrayBuffer(4));
+    },
+  };
+  const workflow = businessBeforeEndWorkflow(flips);
+  let businessCalls = 0;
+  let compensationCalls = 0;
+  await assert.rejects(
+    () => executeWorkflowAsync(workflow, {}, {
+      opEarly: () => { businessCalls += 1; return 'early'; },
+      undoEarly: () => { compensationCalls += 1; return 'undone'; },
+    }),
+    error => {
+      assertEndSharedMemoryError(error);
+      return true;
+    },
+  );
+  // The earlier business action did run, but the end-result error is not a
+  // business failure: it never completes and never triggers compensation.
+  assert.equal(businessCalls, 1);
+  assert.equal(compensationCalls, 0);
+});
+
+test('an earlier business operation swapping a plain buffer for a shared one rejects the run', async () => {
+  const workflow = {
+    id: 'op-swap-shared', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'a' },
+      { id: 'a', type: 'action', operation: 'opA', compensation: { operation: 'undoA' }, next: 'mutate' },
+      { id: 'mutate', type: 'action', operation: 'mutate', next: 'finish' },
+      { id: 'finish', type: 'end', result: { bytes: new Uint8Array([1, 2, 3, 4]), nested: { buf: new ArrayBuffer(2) } } },
+    ],
+  };
+  let compensationCalls = 0;
+  const mutate = () => {
+    workflow.nodes[3].result.bytes = new Uint8Array(new SharedArrayBuffer(4));
+    workflow.nodes[3].result.nested.buf = new SharedArrayBuffer(2);
+    return 'mutated';
+  };
+  await assert.rejects(
+    () => executeWorkflowAsync(workflow, {}, {
+      opA: () => 'A',
+      mutate,
+      undoA: () => { compensationCalls += 1; return 'undone'; },
+    }),
+    error => {
+      assertEndSharedMemoryError(error);
+      return true;
+    },
+  );
+  assert.equal(compensationCalls, 0, 'an end-result error is not action_failed and does not compensate');
+});
+
+test('an earlier operation replacing an end property with a function rejects with the cloneability error', async () => {
+  const workflow = {
+    id: 'op-swap-fn', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'mutate' },
+      { id: 'mutate', type: 'action', operation: 'mutate', next: 'finish' },
+      { id: 'finish', type: 'end', result: { payload: 'ready' } },
+    ],
+  };
+  await assert.rejects(
+    () => executeWorkflowAsync(workflow, {}, {
+      mutate: () => { workflow.nodes[2].result.promise = () => 'nope'; return 'mutated'; },
+    }),
+    /end node finish: result must be a structured-cloneable value/,
+  );
+});
+
+test('a function that appears only in the execution-time clone is reported without leaking the DOMException', () => {
+  let reads = 0;
+  const flips = {
+    get hook() {
+      reads += 1;
+      return reads === 1 ? 'ordinary' : () => 'nope';
+    },
+  };
+  const workflow = linearEndWorkflow(flips);
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+  assert.throws(
+    () => executeWorkflow(workflow, {}),
+    error => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /end node finish: result must be a structured-cloneable value/);
+      return true;
+    },
+  );
+});
+
+test('a value getter that throws when the end node reads it is reported as that end node result error', () => {
+  let reads = 0;
+  const flips = {
+    get value() {
+      reads += 1;
+      if (reads > 1) throw new Error('getter boom');
+      return 'ordinary';
+    },
+  };
+  const workflow = linearEndWorkflow(flips);
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+  assert.throws(
+    () => executeWorkflow(workflow, {}),
+    /end node finish: result must be a structured-cloneable value/,
+  );
+
+  // The same applies to an accessor defined directly on the end node: its
+  // throw at the execution-time read must not escape the engine raw either.
+  // Validation reads it twice (the undefined check and its own clone), so it
+  // answers ordinarily for those and throws only on the third read.
+  let nodeReads = 0;
+  const node = { id: 'done', type: 'end' };
+  Object.defineProperty(node, 'result', {
+    enumerable: true, configurable: true,
+    get() {
+      nodeReads += 1;
+      if (nodeReads > 2) throw new Error('node accessor boom');
+      return 'ordinary';
+    },
+  });
+  const nodeWorkflow = {
+    id: 'node-accessor-throws', entry: 'start',
+    nodes: [{ id: 'start', type: 'trigger', next: 'done' }, node],
+  };
+  // executeWorkflow's own validation is the first read; the end node's
+  // execution-time read is the second and throws.
+  assert.throws(
+    () => executeWorkflow(nodeWorkflow, {}),
+    /end node done: result must be a structured-cloneable value/,
+  );
+});
+
+test('an execution-time value carrying both an uncloneable value and shared memory reports the clone failure first', () => {
+  let aReads = 0;
+  let bReads = 0;
+  const flips = {
+    get a() { aReads += 1; return aReads === 1 ? 'ok' : () => 'nope'; },
+    get b() { bReads += 1; return bReads === 1 ? 'ok' : new SharedArrayBuffer(4); },
+  };
+  const workflow = linearEndWorkflow(flips);
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+  assert.throws(
+    () => executeWorkflow(workflow, {}),
+    /end node finish: result must be a structured-cloneable value/,
+  );
+});
+
+test('shared memory placed only in clone-dropped properties at execution time still completes', async () => {
+  const result = { when: new Date(0), pattern: /ok/, list: [1, 2], keep: new Uint8Array([3, 4]) };
+  const workflow = {
+    id: 'dropped-at-execution', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'mutate' },
+      { id: 'mutate', type: 'action', operation: 'mutate', next: 'finish' },
+      { id: 'finish', type: 'end', result },
+    ],
+  };
+  const run = await executeWorkflowAsync(workflow, {}, {
+    mutate: () => {
+      result.when.aux = new SharedArrayBuffer(4);
+      result.pattern.aux = new SharedArrayBuffer(4);
+      Object.defineProperty(result.list, 'hidden', { value: new SharedArrayBuffer(4), enumerable: false });
+      return 'mutated';
+    },
+  });
+  assert.equal(run.status, 'completed');
+  assert.equal(run.result.when.aux, undefined);
+  assert.equal(run.result.pattern.aux, undefined);
+  assert.equal(Object.hasOwn(run.result.list, 'hidden'), false);
+  assert.deepEqual([...run.result.keep], [3, 4]);
+});
+
+test('the recorded result is the value the clone captured at the end node execution moment, not the validation value', async () => {
+  let reads = 0;
+  const flips = {
+    get phase() { reads += 1; return reads === 1 ? 'validation' : 'execution'; },
+  };
+  const workflow = linearEndWorkflow(flips);
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+  const run = executeWorkflow(workflow, {});
+  assert.equal(run.status, 'completed');
+  assert.equal(run.result.phase, 'execution');
+});
+
+test('an end recorded first keeps its independent copy when a later activated branch mutates the definition', async () => {
+  // The end node is declared before the slow branch's action, so it executes
+  // and records first; the branch then replaces the configured bytes with a
+  // shared buffer. The recorded result was already judged and copied, so the
+  // run still completes with independent bytes.
+  const workflow = {
+    id: 'recorded-before-swap', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: ['finish', 'work'] },
+      { id: 'finish', type: 'end', result: { bytes: new Uint8Array([5, 6, 7, 8]) } },
+      { id: 'work', type: 'action', operation: 'work', next: 'finish' },
+    ],
+  };
+  const run = await executeWorkflowAsync(workflow, {}, {
+    work: () => {
+      workflow.nodes[1].result.bytes = new Uint8Array(new SharedArrayBuffer(4));
+      return 'done';
+    },
+  });
+  assert.equal(run.status, 'completed');
+  assert.ok(run.result.bytes instanceof Uint8Array);
+  assert.ok(!(run.result.bytes.buffer instanceof SharedArrayBuffer));
+  assert.deepEqual([...run.result.bytes], [5, 6, 7, 8]);
+  run.result.bytes[0] = 99;
+  assert.deepEqual([...new Uint8Array(workflow.nodes[1].result.bytes)], [0, 0, 0, 0]);
+});
+
+test('mutating returned nested objects, arrays and plain buffer bytes never reaches the definition', () => {
+  const workflow = linearEndWorkflow({
+    nested: { a: { b: [1, 2, { c: 3 }] } },
+    bytes: Uint8Array.from([9, 8, 7, 6]).buffer,
+    views: [new Uint16Array([258]), new DataView(new ArrayBuffer(2))],
+  });
+  const definition = workflow.nodes[1].result;
+  const run = executeWorkflow(workflow, {});
+  assert.equal(run.status, 'completed');
+
+  run.result.nested.a.b[2].c = 99;
+  run.result.nested.a.b.push(4);
+  delete run.result.nested.a.b[0];
+  new Uint8Array(run.result.bytes).fill(1);
+  run.result.views[0][0] = 0;
+  new Uint8Array(run.result.views[1].buffer).fill(255);
+
+  assert.deepEqual(definition.nested.a.b, [1, 2, { c: 3 }]);
+  assert.deepEqual([...new Uint8Array(definition.bytes)], [9, 8, 7, 6]);
+  assert.equal(definition.views[0][0], 258);
+  assert.deepEqual([...new Uint8Array(definition.views[1].buffer)], [0, 0]);
+});
