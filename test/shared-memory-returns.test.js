@@ -343,6 +343,221 @@ test('shared bytes placed only where structured cloning drops them are not treat
 });
 
 // ---------------------------------------------------------------------------
+// Shared memory in properties structuredClone discards from Date/RegExp/array
+// ---------------------------------------------------------------------------
+
+test('a Date carrying shared memory in an attached own property succeeds, keeping the date only', async () => {
+  let calls = 0;
+  const held = new Date('2021-06-07T08:09:10.000Z');
+  held.aux = new SharedArrayBuffer(8);
+  Object.defineProperty(held, 'hidden', { value: new SharedArrayBuffer(4), enumerable: false });
+  const execution = await executeWorkflowAsync(workflow({ retry: ZERO_DELAY_RETRY }), {}, {
+    opA: () => 'A',
+    opB: () => { calls += 1; return held; },
+    undoA: () => 'undone',
+  });
+  assert.equal(execution.status, 'completed');
+  // The success is recorded exactly once: no failed attempt, no retry wait.
+  assert.equal(calls, 1);
+  const bRecords = execution.actionAttempts.filter(r => r.nodeId === 'b');
+  assert.deepEqual(bRecords.map(r => [r.attempt, r.ok, r.error, r.nextDelayMs]), [[1, true, null, 0]]);
+  const saved = execution.context.output.b;
+  assert.ok(saved instanceof Date, 'the saved value keeps its Date type, never stringified');
+  assert.equal(saved.getTime(), held.getTime());
+  assert.equal(saved.aux, undefined);
+  assert.equal(Object.hasOwn(saved, 'hidden'), false);
+  // Successors run normally and no compensation is triggered.
+  assert.deepEqual(execution.trace.map(n => n.nodeId), ['start', 'prep', 'a', 'b', 'after', 'done']);
+  assert.equal(execution.compensationStatus, 'not_needed');
+  assert.deepEqual(execution.compensationAttempts, []);
+  // The saved date is independent of the object the operation keeps mutating.
+  held.setTime(0);
+  held.aux[0] = 123;
+  assert.equal(execution.context.output.b.getTime(), Date.parse('2021-06-07T08:09:10.000Z'));
+});
+
+test('a RegExp carrying shared memory in an attached own property succeeds, keeping the regexp only', async () => {
+  const held = /pattern/gi;
+  held.shared = new SharedArrayBuffer(4);
+  const execution = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
+    opA: () => 'A',
+    opB: () => held,
+  });
+  assert.equal(execution.status, 'completed');
+  const saved = execution.context.output.b;
+  assert.ok(saved instanceof RegExp, 'the saved value keeps its RegExp type, never stringified');
+  assert.equal(saved.source, 'pattern');
+  assert.equal(saved.flags, 'gi');
+  assert.equal(saved.shared, undefined);
+  assert.deepEqual('2024-pattern-x'.match(saved) !== null, true);
+});
+
+test('an array carrying shared memory in a non-enumerable own property succeeds with its indexed content', async () => {
+  let calls = 0;
+  const held = [1, 2, 3];
+  Object.defineProperty(held, 'aux', { value: new SharedArrayBuffer(8), enumerable: false });
+  // A non-enumerable index clones as a hole; it must not be inspected either.
+  Object.defineProperty(held, 1, { value: 2, enumerable: false, configurable: true, writable: true });
+  const execution = await executeWorkflowAsync(workflow({ retry: ZERO_DELAY_RETRY }), {}, {
+    opA: () => 'A',
+    opB: () => { calls += 1; return held; },
+    undoA: () => 'undone',
+  });
+  assert.equal(execution.status, 'completed');
+  assert.equal(calls, 1);
+  const saved = execution.context.output.b;
+  assert.ok(Array.isArray(saved), 'the saved value stays an array, never stringified');
+  assert.equal(saved.length, 3);
+  assert.equal(saved[0], 1);
+  assert.equal(Object.hasOwn(saved, '1'), false);
+  assert.equal(saved[2], 3);
+  assert.equal(Object.hasOwn(saved, 'aux'), false);
+  assert.deepEqual(Object.keys(saved), ['0', '2']);
+  held.push(4);
+  assert.equal(execution.context.output.b.length, 3);
+});
+
+test('enumerable non-index properties of an array still count as saved content', async () => {
+  // Enumerable non-index properties DO survive structured cloning: shared
+  // memory there must still fail, while an ordinary one is copied.
+  const bad = Object.assign([1, 2], { note: new SharedArrayBuffer(4) });
+  const failed = await executeWorkflowAsync(workflow({ retry: ZERO_DELAY_RETRY }), {}, {
+    opA: () => 'A', opB: () => bad, undoA: () => 'undone',
+  });
+  assert.equal(failed.status, 'action_failed');
+  assertSharedMemoryError(failed.error);
+  assert.equal(Object.hasOwn(failed.context.output, 'b'), false);
+
+  const good = Object.assign([1, 2], { note: 'kept' });
+  const ok = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
+    opA: () => 'A', opB: () => good,
+  });
+  assert.equal(ok.status, 'completed');
+  assert.deepEqual([...ok.context.output.b], [1, 2]);
+  assert.equal(ok.context.output.b.note, 'kept');
+});
+
+test('Date/RegExp/array auxiliary shared bytes nested in a plain object are dropped there too', async () => {
+  const date = new Date('2020-02-03T04:05:06.000Z');
+  date.aux = new SharedArrayBuffer(4);
+  const regexp = /x/y;
+  regexp.aux = new SharedArrayBuffer(4);
+  const list = ['a', 'b'];
+  Object.defineProperty(list, 'aux', { value: new SharedArrayBuffer(4), enumerable: false });
+
+  const execution = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
+    opA: () => 'A',
+    opB: () => {
+      const root = { date, regexp, list };
+      // Legal circular and repeated references survive alongside the leaves.
+      root.self = root;
+      root.dateAgain = date;
+      return root;
+    },
+  });
+  assert.equal(execution.status, 'completed');
+  const saved = execution.context.output.b;
+  assert.equal(saved.self, saved);
+  assert.equal(saved.dateAgain, saved.date);
+  assert.ok(saved.date instanceof Date);
+  assert.equal(saved.date.getTime(), date.getTime());
+  assert.equal(saved.date.aux, undefined);
+  assert.ok(saved.regexp instanceof RegExp);
+  assert.equal(saved.regexp.flags, 'y');
+  assert.equal(saved.regexp.aux, undefined);
+  assert.deepEqual([...saved.list], ['a', 'b']);
+  assert.equal(Object.hasOwn(saved.list, 'aux'), false);
+});
+
+test('shared memory that really is saved alongside a Date leaf still fails the attempt', async () => {
+  const date = new Date(123);
+  date.aux = new SharedArrayBuffer(4);
+  const execution = await executeWorkflowAsync(workflow({ retry: ZERO_DELAY_RETRY }), {}, {
+    opA: () => 'A',
+    opB: () => ({ when: date, shared: new Uint8Array(new SharedArrayBuffer(4)) }),
+    undoA: () => 'undone',
+  });
+  assert.equal(execution.status, 'action_failed');
+  assertSharedMemoryError(execution.error);
+  assert.equal(Object.hasOwn(execution.context.output, 'b'), false);
+});
+
+test('Date/RegExp subclasses keep dropping attached shared bytes but keep their cloned value', async () => {
+  class MyDate extends Date {}
+  class MyRegExp extends RegExp {}
+  const date = new MyDate('2019-01-02T03:04:05.000Z');
+  date.aux = new SharedArrayBuffer(4);
+  const regexp = new MyRegExp('sub', 'g');
+  regexp.aux = new SharedArrayBuffer(4);
+  const execution = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
+    opA: () => 'A',
+    opB: () => ({ date, regexp }),
+  });
+  assert.equal(execution.status, 'completed');
+  assert.ok(execution.context.output.b.date instanceof Date);
+  assert.equal(execution.context.output.b.date.getTime(), date.getTime());
+  assert.equal(execution.context.output.b.date.aux, undefined);
+  assert.ok(execution.context.output.b.regexp instanceof RegExp);
+  assert.equal(execution.context.output.b.regexp.source, 'sub');
+  assert.equal(execution.context.output.b.regexp.aux, undefined);
+});
+
+test('boxed primitive leaves with attached shared bytes succeed without the attached property', async () => {
+  const boxed = new Number(42);
+  boxed.aux = new SharedArrayBuffer(4);
+  const execution = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
+    opA: () => 'A',
+    opB: () => boxed,
+  });
+  assert.equal(execution.status, 'completed');
+  const saved = execution.context.output.b;
+  assert.equal(typeof saved, 'object');
+  assert.equal(Number(saved), 42);
+  assert.equal(saved.aux, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Compensation returns follow the same rule
+// ---------------------------------------------------------------------------
+
+test('a compensation returning a Date/array whose dropped properties hold shared memory succeeds once with an independent result', async () => {
+  let undoCalls = 0;
+  const date = new Date('2018-08-08T08:08:08.000Z');
+  date.aux = new SharedArrayBuffer(4);
+  const list = [7, 8];
+  Object.defineProperty(list, 'aux', { value: new SharedArrayBuffer(4), enumerable: false });
+
+  const execution = await executeWorkflowAsync(compensationFailureWorkflow(), {}, {
+    opA: () => 'A',
+    opB: () => 'B',
+    opC: () => { throw new Error('c-boom'); },
+    undoA: () => 'ua',
+    undoB: () => { undoCalls += 1; return { date, list }; },
+  });
+  // The original terminal state and failure reason survive unchanged.
+  assert.equal(execution.status, 'action_failed');
+  assert.equal(execution.nodeId, 'c');
+  assert.equal(execution.error, 'c-boom');
+  assert.equal(execution.compensationStatus, 'completed');
+  assert.equal(undoCalls, 1, 'a successful compensation is not retried');
+  assert.deepEqual(
+    execution.compensationAttempts.map(r => [r.nodeId, r.attempt, r.ok, r.nextDelayMs]),
+    [['b', 1, true, 0], ['a', 1, true, 0]],
+  );
+  const result = execution.compensationAttempts[0].result;
+  assert.ok(result.date instanceof Date);
+  assert.equal(result.date.getTime(), date.getTime());
+  assert.equal(result.date.aux, undefined);
+  assert.deepEqual([...result.list], [7, 8]);
+  assert.equal(Object.hasOwn(result.list, 'aux'), false);
+  // The recorded compensation result stays independent of retained objects.
+  date.setTime(0);
+  list[0] = 1;
+  assert.equal(execution.compensationAttempts[0].result.date.getTime(), Date.parse('2018-08-08T08:08:08.000Z'));
+  assert.equal(execution.compensationAttempts[0].result.list[0], 7);
+});
+
+// ---------------------------------------------------------------------------
 // Compensation returns containing shared memory
 // ---------------------------------------------------------------------------
 
@@ -522,14 +737,20 @@ test('objects merely faking SharedArrayBuffer/Map/Error tags stay accepted; nest
 });
 
 test('hostile return values (throwing getters/proxies) fail the attempt without crashing the engine', async () => {
+  const nestedRevoked = (() => {
+    const handle = Proxy.revocable({ keep: 1 }, {});
+    handle.revoke();
+    return { nested: handle.proxy };
+  })();
   const hostileList = [
     { get x() { throw new Error('getter-go-boom'); } },
     new Proxy({}, { get() { throw new Error('trap-go-boom'); } }),
     (() => { const handle = Proxy.revocable({ keep: 1 }, {}); handle.revoke(); return handle.proxy; })(),
+    nestedRevoked,
   ];
   // The throwing getter surfaces as the standard uncloneable-return message;
   // the proxy traps propagate their own text through structuredClone.
-  const expectedErrors = [/structured-cloned/, /trap-go-boom/, /proxy that has been revoked/];
+  const expectedErrors = [/structured-cloned/, /trap-go-boom/, /proxy that has been revoked/, /structured-cloned/];
   for (const [index, bad] of hostileList.entries()) {
     const execution = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
       opA: () => 'A',

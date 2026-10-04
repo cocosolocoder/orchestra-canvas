@@ -846,23 +846,71 @@ const DATAVIEW_BUFFER_GETTER = Object.getOwnPropertyDescriptor(DataView.prototyp
 // every saved output is an independent copy. Such a return value is therefore
 // explicitly unsupported and fails the attempt.
 //
-// This walks exactly the graph the structured clone algorithm would traverse
-// (string-keyed own enumerable properties of plain objects and arrays —
-// including non-index properties on arrays — Map keys and values, Set members,
-// and Error "cause"), so the rejection is consistent wherever the shared
-// memory sits: a bare SharedArrayBuffer, a byte view over one, or bytes nested
-// inside objects, arrays, Maps (key or value) or Sets. A plain ArrayBuffer and
-// its views are accepted; circular and repeated references are visited once
-// via the same identity set the clone would use, so legal graphs' reference
-// relationships are unaffected by the check itself.
+// This walks exactly the graph the structured clone algorithm would actually
+// *save*, so the rejection matches the cloned value rather than the source
+// object:
+// - plain objects, arrays and arbitrary class instances contribute only
+//   own enumerable string-keyed properties (Object.keys) — symbol-keyed and
+//   non-enumerable properties are skipped exactly as the clone skips them;
+//   this includes array indices (a non-enumerable index clones as a hole)
+//   and enumerable non-index array properties, which do survive;
+// - Map keys and values and Set members are walked;
+// - an Error's "cause" is walked whether enumerable or not (it is the one
+//   non-enumerable the clone preserves), while the Error's other own
+//   properties are dropped;
+// - Date and RegExp (including subclasses) clone only their internal
+//   value/pattern, boxed primitives only their primitive, and Blob/File,
+//   DOMException and web CryptoKey only their internal slots — every own
+//   property attached to them is discarded, so shared memory stashed there is
+//   never part of the saved value and must not fail the attempt;
+// - a SharedArrayBuffer itself, or a byte view whose true internal-slot
+//   buffer is one, fails wherever the clone reaches it.
+// A plain ArrayBuffer and its views are accepted; circular and repeated
+// references are visited once via the same identity set the clone would use,
+// so legal graphs' reference relationships are unaffected by the check.
 //
 // Classification uses Node's internal-slot brand checks (util.types): they
-// recognize buffers, views, containers and errors constructed in another realm
-// and reject objects merely faking the right @@toStringTag, which tag matching
-// alone could not. Every possibly observable access is still guarded: a return
+// recognize buffers, views, containers, errors, Date/RegExp and boxed
+// primitives constructed in another realm and reject objects merely faking
+// the right @@toStringTag, which tag matching alone could not. Host-object
+// leaves (DOMException, Blob/File, CryptoKey) are recognized with guarded
+// instanceof checks — instanceof drives prototype traps and can throw on a
+// revoked proxy. DOMException is checked before the native-error branch:
+// util.types brands it as an Error, but unlike a real Error its "cause" is
+// not cloned. Every other possibly observable access is guarded too: a return
 // value that throws while inspected (a revoked proxy, a trap/getter that
 // throws) yields only the edges that could be read, and the structuredClone
 // step that follows reports it in the usual way — this check never throws.
+const HOST_LEAF_CONSTRUCTORS = [
+  // DOMException must precede the native-error branch (see above).
+  typeof DOMException === 'function' ? DOMException : null,
+  // instanceof Blob also matches File.
+  typeof Blob === 'function' ? Blob : null,
+  typeof CryptoKey === 'function' ? CryptoKey : null,
+].filter(constructor => constructor !== null);
+
+function isInstanceOfGuarded(value, constructor) {
+  try {
+    return value instanceof constructor;
+  } catch {
+    // A revoked proxy (or a throwing Symbol.hasInstance/prototype trap)
+    // cannot be classified this way; fall through to ordinary traversal.
+    return false;
+  }
+}
+
+// Array.isArray performs a proxy-revocation check (IsArray) and throws on a
+// revoked proxy, unlike the internal-slot brand checks. A throw means the
+// value cannot be classified as an array here; the Object.keys step below is
+// guarded too and structuredClone reports the unreadable value itself.
+function isArrayGuarded(value) {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
 function containsSharedMemory(value) {
   let rootIsObject;
   try {
@@ -934,17 +982,32 @@ function containsSharedMemory(value) {
       continue;
     }
 
-    if (Array.isArray(current)) {
-      // Indexed slots plus enumerable own string-keyed non-index properties,
-      // exactly as structuredClone treats arrays.
+    // Host clone leaves whose internal slots alone are copied: any own
+    // property attached to them is discarded by structuredClone, so shared
+    // memory carried there never reaches the saved value. This must precede
+    // the native-error branch — DOMException brands as a native error but,
+    // unlike a real Error, has no cloned "cause".
+    let isHostLeaf = false;
+    for (const constructor of HOST_LEAF_CONSTRUCTORS) {
+      if (isInstanceOfGuarded(current, constructor)) {
+        isHostLeaf = true;
+        break;
+      }
+    }
+    if (isHostLeaf) continue;
+
+    if (isArrayGuarded(current)) {
+      // Enumerable indices plus enumerable own string-keyed non-index
+      // properties, exactly as structuredClone treats arrays: a
+      // non-enumerable property — including a non-enumerable index, which
+      // clones as a hole — is dropped and therefore never inspected.
       let keys;
       try {
-        keys = Reflect.ownKeys(current);
+        keys = Object.keys(current);
       } catch {
         keys = [];
       }
       for (const key of keys) {
-        if (typeof key !== 'string') continue;
         const [exists, child] = read(current, key);
         if (exists) pushIfObject(child);
       }
@@ -987,10 +1050,19 @@ function containsSharedMemory(value) {
       continue;
     }
 
-    // Plain objects (any prototype), Date, RegExp and other
-    // structured-cloneable leaf objects: only own enumerable string-keyed
-    // properties participate in the clone. Symbol-keyed and non-enumerable
-    // properties are skipped exactly as structuredClone skips them.
+    if (nodeTypes.isDate(current) || nodeTypes.isRegExp(current)
+      || nodeTypes.isBoxedPrimitive(current)) {
+      // Date and RegExp clone only their internal value/pattern; boxed
+      // primitives (Number/String/Boolean/BigInt/Symbol) only their wrapped
+      // primitive. Every attached own property — enumerable or not — is
+      // dropped, so it can never carry shared memory into the saved value.
+      continue;
+    }
+
+    // Plain objects and arbitrary class instances (any prototype): only own
+    // enumerable string-keyed properties participate in the clone.
+    // Symbol-keyed and non-enumerable properties are skipped exactly as
+    // structuredClone skips them.
     let keys;
     try {
       keys = Object.keys(current);
