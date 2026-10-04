@@ -432,12 +432,32 @@ function compileAction(node) {
 // symbol, getter-built object the clone algorithm rejects, etc.) nested in a
 // result object/array is a definition error naming the end node and reason;
 // bare function results cannot be delivered through JSON-style results either.
+//
+// A value that clones but whose clone retains shared memory is rejected for
+// the same reason the run input, operation return values and legacy action
+// messages are: cloning a SharedArrayBuffer (or a typed array / DataView
+// backed by one) "succeeds" while the clone keeps sharing the underlying
+// bytes, so the independent result copy the end node promises — the
+// definition's own result is cloned again at the end node's execution moment,
+// and the returned value is promised independent of the definition, other
+// runs and the caller's own later mutations — could not be guaranteed. The
+// check therefore runs on the cloned value with the same clone-shaped
+// traversal (containsSharedMemory): shared memory placed only where cloning
+// drops it (an attached property of a Date/RegExp, a non-enumerable or
+// symbol-keyed property, an Error own property other than cause) is discarded
+// with that property and never condemns the result. Like every other
+// definition check, it covers every end node — including ends on untaken
+// branches and entry-unreachable ones — before a single node can execute.
 function compileEndResult(node) {
   if (!Object.hasOwn(node, 'result') || node.result === undefined) return;
+  let cloned;
   try {
-    structuredClone(node.result);
+    cloned = structuredClone(node.result);
   } catch {
     throw new Error(`end node ${node.id}: result must be a structured-cloneable value (objects and arrays must not contain functions)`);
+  }
+  if (containsSharedMemory(cloned)) {
+    throw new Error(`end node ${node.id}: result contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so shared bytes must not be returned as the end result`);
   }
 }
 
