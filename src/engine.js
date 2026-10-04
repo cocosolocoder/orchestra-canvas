@@ -846,41 +846,30 @@ const DATAVIEW_BUFFER_GETTER = Object.getOwnPropertyDescriptor(DataView.prototyp
 // every saved output is an independent copy. Such a return value is therefore
 // explicitly unsupported and fails the attempt.
 //
-// This walks exactly the graph the structured clone algorithm would actually
-// *save*, so the rejection matches the cloned value rather than the source
-// object:
-// - plain objects, arrays and arbitrary class instances contribute only
-//   own enumerable string-keyed properties (Object.keys) — symbol-keyed and
-//   non-enumerable properties are skipped exactly as the clone skips them;
-//   this includes array indices (a non-enumerable index clones as a hole)
-//   and enumerable non-index array properties, which do survive;
-// - Map keys and values and Set members are walked;
-// - an Error's "cause" is walked whether enumerable or not (it is the one
-//   non-enumerable the clone preserves), while the Error's other own
-//   properties are dropped;
-// - Date and RegExp (including subclasses) clone only their internal
-//   value/pattern, boxed primitives only their primitive, and Blob/File,
-//   DOMException and web CryptoKey only their internal slots — every own
-//   property attached to them is discarded, so shared memory stashed there is
-//   never part of the saved value and must not fail the attempt;
-// - a SharedArrayBuffer itself, or a byte view whose true internal-slot
-//   buffer is one, fails wherever the clone reaches it.
-// A plain ArrayBuffer and its views are accepted; circular and repeated
-// references are visited once via the same identity set the clone would use,
-// so legal graphs' reference relationships are unaffected by the check.
-//
-// Classification uses Node's internal-slot brand checks (util.types): they
-// recognize buffers, views, containers, errors, Date/RegExp and boxed
-// primitives constructed in another realm and reject objects merely faking
-// the right @@toStringTag, which tag matching alone could not. Host-object
-// leaves (DOMException, Blob/File, CryptoKey) are recognized with guarded
-// instanceof checks — instanceof drives prototype traps and can throw on a
-// revoked proxy. DOMException is checked before the native-error branch:
-// util.types brands it as an Error, but unlike a real Error its "cause" is
-// not cloned. Every other possibly observable access is guarded too: a return
-// value that throws while inspected (a revoked proxy, a trap/getter that
-// throws) yields only the edges that could be read, and the structuredClone
-// step that follows reports it in the usual way — this check never throws.
+// This runs on the value AFTER structuredClone has produced it, so it judges
+// exactly the content that will be saved — never the original return value.
+// That ordering matters:
+// - an enumerable getter is invoked only by the clone's own read; the check
+//   sees the value that was actually saved (a getter returning 7 first and
+//   shared bytes later saves — and is judged on — 7);
+// - a Map/Set with a custom Symbol.iterator (empty, throwing, or fabricating
+//   entries) cannot hide its real members or invent shared memory, because
+//   the clone already captured the true internal entries;
+// - properties the clone discards (own properties of Date/RegExp/byte views,
+//   symbol-keyed or non-enumerable properties, Error own properties other
+//   than "cause") are simply absent here and can never fail the attempt.
+// The clone graph contains only genuine clone-produced objects — no getters,
+// proxies or custom iterators — so the traversal below can never observe
+// user code; the remaining guards only keep it total for host objects the
+// clone may carry (DOMException, Blob/File, CryptoKey) and cross-realm
+// values. Classification uses Node's internal-slot brand checks
+// (util.types), which recognize buffers, views, containers, errors,
+// Date/RegExp and boxed primitives from another realm and reject objects
+// merely faking the right @@toStringTag. DOMException is checked before the
+// native-error branch: util.types brands it as an Error, but unlike a real
+// Error its "cause" is not cloned. A plain ArrayBuffer and its views are
+// accepted; circular and repeated references are visited once via an
+// identity set, so legal graphs' reference relationships are unaffected.
 const HOST_LEAF_CONSTRUCTORS = [
   // DOMException must precede the native-error branch (see above).
   typeof DOMException === 'function' ? DOMException : null,
@@ -1127,11 +1116,15 @@ async function runWithRetries({
       record.error = lastReason;
     }
 
-    if (record.error === null && containsSharedMemory(returned)) {
-      lastReason = sharedMemoryFailureMessage;
-      record.error = lastReason;
-    }
-
+    // Clone first, then judge the clone: the isolation check must reflect
+    // exactly the content that will be saved. Inspecting the original return
+    // value would read enumerable getters an extra time (a getter that
+    // changes its answer between reads could swap ordinary saved content for
+    // later-appearing shared memory, or vice versa) and would iterate Map/Set
+    // through a possibly-overridden Symbol.iterator, while structuredClone
+    // reads the real internal entries. A return value whose normal reads
+    // throw, or that cannot be cloned at all, is the ordinary uncloneable
+    // failure — never an exception escaping the run.
     if (record.error === null) {
       try {
         returned = structuredClone(returned);
@@ -1139,6 +1132,11 @@ async function runWithRetries({
         lastReason = cloneFailureMessage;
         record.error = lastReason;
       }
+    }
+
+    if (record.error === null && containsSharedMemory(returned)) {
+      lastReason = sharedMemoryFailureMessage;
+      record.error = lastReason;
     }
 
     if (record.error === null) {

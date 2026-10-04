@@ -140,7 +140,7 @@ Mutations made to the copies during a failed attempt never reach later attempts 
 
 Every saved output is promised to be an independent copy. A `SharedArrayBuffer` cannot satisfy that promise: structured cloning it (or a typed array / `DataView` backed by it) "succeeds", but the clone keeps **sharing the underlying bytes** with the object the implementation holds — bytes the implementation rewrites later would silently change the already saved node output. Such a return value is therefore explicitly unsupported and fails the attempt, regardless of whether it is returned synchronously or through a Promise.
 
-The attempt fails whenever the shared memory sits in content the structured clone actually **saves**:
+The judgment is made on the cloned value itself — exactly the content that will be saved. Each enumerable getter is therefore read only by the clone's own single read (a getter that answers differently across reads is judged, and saved, by the value the clone actually got), and a `Map`/`Set` is judged by its real members, which the clone reads directly from the container: a custom `Symbol.iterator` that yields nothing or throws cannot hide shared members, and one that fabricates shared memory cannot condemn ordinary members. The attempt fails whenever the shared memory sits in content the structured clone actually **saves**:
 
 - a `SharedArrayBuffer` returned directly;
 - a typed array (`Int8Array` … `BigUint64Array`, including `Uint8Array`) or a `DataView` whose buffer is a `SharedArrayBuffer`;
