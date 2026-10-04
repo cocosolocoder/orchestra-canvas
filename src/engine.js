@@ -350,6 +350,15 @@ function compileRetry(config, label) {
   };
 }
 
+// The two message failure kinds, shared by validation (compileAction) and
+// the execution-time capture (captureMessageOutput) so the same content is
+// judged by the same words at both moments. Each names the action node and
+// the reason an independent copy cannot be guaranteed.
+const MESSAGE_UNCLONEABLE_MESSAGE = nodeId =>
+  `action node ${nodeId}: message must be a structured-cloneable value (objects and arrays must not contain functions)`;
+const MESSAGE_SHARED_MEMORY_MESSAGE = nodeId =>
+  `action node ${nodeId}: message contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so shared bytes must not enter the action output`;
+
 // An action node either keeps the legacy `message` behavior, names a business
 // operation the caller supplies at run time, and/or declares a compensation
 // operation that undoes its business effect. Both retry blocks are optional
@@ -410,15 +419,19 @@ function compileAction(node) {
   // where cloning drops it (an attached property of a Date/RegExp, a
   // non-enumerable property, an Error own property other than cause) is
   // discarded with that property and never condemns the message.
+  //
+  // Validation only judges the message as it is NOW; captureMessageOutput
+  // re-enforces both failure kinds at the action's own execution moment,
+  // against the content that run is actually about to save.
   if (name === null && Object.hasOwn(node, 'message') && node.message !== undefined) {
     let cloned;
     try {
       cloned = structuredClone(node.message);
     } catch {
-      throw new Error(`action node ${node.id}: message must be a structured-cloneable value (objects and arrays must not contain functions)`);
+      throw new Error(MESSAGE_UNCLONEABLE_MESSAGE(node.id));
     }
     if (containsSharedMemory(cloned)) {
-      throw new Error(`action node ${node.id}: message contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so shared bytes must not enter the action output`);
+      throw new Error(MESSAGE_SHARED_MEMORY_MESSAGE(node.id));
     }
   }
 
@@ -515,6 +528,58 @@ function captureEndResult(node) {
   }
   if (containsSharedMemory(cloned)) {
     throw new Error(END_RESULT_SHARED_MEMORY_MESSAGE(node.id));
+  }
+  return cloned;
+}
+
+// Reads a legacy message action's configured message at the action's own
+// execution moment and produces the independent copy that will be saved as
+// the node's output. This re-enforces, for exactly the content this run is
+// about to save, the promise validation already made for the message as it
+// was then — validation cannot see what an enumerable getter returns on its
+// later read, nor what a preceding business operation or another activated
+// branch does to the configured message before this action runs:
+//
+//   - the root message is read exactly once here (the own-property check
+//     does not touch the value), and every nested enumerable accessor is
+//     read only by structuredClone, so no extra read can disturb a getter's
+//     return order or swap the judged content for a later value;
+//   - a message that cannot be cloned at execution time — a getter that now
+//     yields a function, a root the run replaced with an uncloneable value,
+//     a property read that throws — fails with the same node-naming
+//     cloneability error validation uses;
+//   - shared memory the clone retains (a SharedArrayBuffer or a typed
+//     array/DataView backed by one, anywhere in the saved graph) fails with
+//     the shared-memory reason, while shared memory placed only where
+//     cloning drops it is discarded with that property and never condemns
+//     an otherwise-legal message. Uncloneability takes precedence, matching
+//     validation: the clone is attempted first.
+//
+// An unset, undefined or null message still defaults to action:<node id>;
+// "", 0 and false pass through untouched. A plain ArrayBuffer and its views
+// are copied byte-for-byte with type and content preserved.
+//
+// Any failure is thrown here as an ordinary Error naming the action node
+// rather than recorded as a run status: the synchronous entry propagates it
+// and the asynchronous entry's Promise rejects with it. It is never a
+// "completed" result and never an action_failed — a message action has no
+// retry budget to spend — and it triggers no compensation. Because the throw
+// happens before the output is stored and before successors are activated,
+// the node leaves no success output behind and no later node runs.
+function captureMessageOutput(node) {
+  if (!Object.hasOwn(node, 'message')) return `action:${node.id}`;
+  // The root value's single read: an unset, undefined or null message
+  // becomes the default; everything else is judged on this read alone.
+  const message = node.message;
+  if (message === undefined || message === null) return `action:${node.id}`;
+  let cloned;
+  try {
+    cloned = structuredClone(message);
+  } catch {
+    throw new Error(MESSAGE_UNCLONEABLE_MESSAGE(node.id));
+  }
+  if (containsSharedMemory(cloned)) {
+    throw new Error(MESSAGE_SHARED_MEMORY_MESSAGE(node.id));
   }
   return cloned;
 }
@@ -1465,12 +1530,19 @@ function applyRegularNode(node, state) {
     // fields, adding or deleting properties, or changing array members of the
     // returned output never reaches the definition, another run, or an output
     // this action recorded while another activated branch is still waiting.
-    // An unset, undefined or null message defaults to action:<node id>;
-    // "", 0 and false pass through untouched. Validation already guarantees
-    // that an explicit message is structured-cloneable, so this cannot throw
-    // mid-run.
-    const hasMessage = Object.hasOwn(node, 'message') && node.message !== undefined && node.message !== null;
-    const value = hasMessage ? structuredClone(node.message) : `action:${node.id}`;
+    // captureMessageOutput judges the value actually read now: validation
+    // only proved the message was cloneable — and free of retained shared
+    // memory — as it was then, and an enumerable getter may answer
+    // differently on this, its only execution-time read, or a preceding
+    // business operation may have replaced ordinary buffers with shared ones
+    // (or the whole message with an uncloneable value). A message that fails
+    // the execution-time check throws here, before any output is stored and
+    // before successors are activated: the synchronous entry propagates the
+    // error and the asynchronous entry's Promise rejects with it — never a
+    // "completed" or action_failed result, no retry budget spent and no
+    // compensation. An unset, undefined or null message defaults to
+    // action:<node id>; "", 0 and false pass through untouched.
+    const value = captureMessageOutput(node);
     setNodeOutput(state.context.output, node.id, value);
   }
   if (node.type === 'form') {
