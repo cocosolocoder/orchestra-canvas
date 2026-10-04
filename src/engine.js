@@ -828,16 +828,73 @@ function retryDelay(retry, failedAttempt) {
   return Math.min(grown, retry.maxDelayMs);
 }
 
+// structuredClone accepts a SharedArrayBuffer and copies a typed array or
+// DataView built on one without detaching or copying its underlying bytes —
+// the clone keeps sharing storage with the value the operation implementation
+// holds, so bytes the implementation writes later change the saved node
+// output. Every operation output is promised to be an independent copy, so a
+// return value that contains shared memory anywhere is an unsupported value
+// and fails the attempt, for both business operations and compensations.
+//
+// The walk covers the same graph shapes the clone algorithm preserves: plain
+// objects and arrays (own enumerable string-keyed properties), Map keys and
+// values, Set members, and the byte views. A plain ArrayBuffer and any view
+// over one stay accepted. Objects are visited by identity, so circular and
+// repeated references terminate the walk and never reject a cloneable graph.
+function containsSharedMemory(value) {
+  const seen = new Set();
+  const stack = [value];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current === null || typeof current !== 'object') continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+
+    if (current instanceof SharedArrayBuffer) return true;
+    // Typed arrays and DataViews inherit their storage from `.buffer`, which
+    // is checked next: a view over a SharedArrayBuffer fails just like a bare
+    // one, while views over a plain ArrayBuffer are accepted.
+    if (ArrayBuffer.isView(current)) {
+      stack.push(current.buffer);
+      continue;
+    }
+    if (current instanceof ArrayBuffer) continue;
+    if (current instanceof Date || current instanceof RegExp) continue;
+
+    if (current instanceof Map) {
+      for (const [key, mapValue] of current) {
+        stack.push(key);
+        stack.push(mapValue);
+      }
+      continue;
+    }
+    if (current instanceof Set) {
+      for (const member of current) stack.push(member);
+      continue;
+    }
+    if (Array.isArray(current)) {
+      for (const item of current) stack.push(item);
+      continue;
+    }
+    // Match structuredClone's own traversal: own enumerable properties.
+    for (const key of Object.keys(current)) {
+      stack.push(current[key]);
+    }
+  }
+  return false;
+}
+
 // Runs an operation under a retry policy — the one attempt loop shared by
 // business actions and compensations. Every invocation works on fresh
 // structured-clone argument copies produced by prepareArgs, so mutations by
 // a failed attempt are discarded before the next try; a thrown exception, a
-// rejected Promise, or a return value that cannot be structured-cloned all
-// count as a failed attempt, and the recorded success value is a clone
-// independent of any object the implementation keeps holding. Attempts are
-// numbered from 1, the wait after a failure follows the configured backoff
-// (zero stays zero, nothing is awaited after the last attempt), and each
-// actual invocation appends exactly one record, in order, via collect.
+// rejected Promise, a return value containing shared memory, or one that
+// cannot be structured-cloned all count as a failed attempt, and the recorded
+// success value is a clone independent of any object the implementation keeps
+// holding. Attempts are numbered from 1, the wait after a failure follows the
+// configured backoff (zero stays zero, nothing is awaited after the last
+// attempt), and each actual invocation appends exactly one record, in order,
+// via collect.
 //
 // The two callers differ only through the hooks:
 // - prepareArgs(attempt) builds this attempt's fresh argument copies;
@@ -845,13 +902,17 @@ function retryDelay(retry, failedAttempt) {
 // - createRecord(attempt) shapes the record (business attempts carry no
 //   operation/result fields, compensation attempts do);
 // - cloneFailureMessage names the operation kind for uncloneable returns;
+// - sharedMemoryFailureMessage names it for returns containing shared memory;
 // - collect appends to the caller's own attempt list;
 // - onSuccess stores caller-specific success data on the record.
 // When a cancellation signal is given, no new attempt starts once it has
 // fired — even with a zero retry delay — and a wait in progress ends early;
 // an attempt already running is always awaited and its outcome recorded.
 // Compensation passes no signal and is therefore never interrupted.
-async function runWithRetries({ retry, signal = null, prepareArgs, invoke, createRecord, cloneFailureMessage, collect, onSuccess }) {
+async function runWithRetries({
+  retry, signal = null, prepareArgs, invoke, createRecord,
+  cloneFailureMessage, sharedMemoryFailureMessage, collect, onSuccess,
+}) {
   let lastReason = null;
 
   for (let attempt = 1; attempt <= retry.attempts; attempt += 1) {
@@ -866,6 +927,25 @@ async function runWithRetries({ retry, signal = null, prepareArgs, invoke, creat
     } catch (error) {
       lastReason = describeError(error);
       record.error = lastReason;
+    }
+
+    if (record.error === null) {
+      // Reject shared memory before cloning: structuredClone itself accepts a
+      // SharedArrayBuffer and shares its bytes with the implementation-held
+      // object, so the saved output would mutate behind the run. A walk that
+      // throws on a hostile value (a proxy trap, a throwing getter) falls
+      // through to structuredClone, which rejects the same value and turns
+      // that into the usual clone-failure attempt instead of breaking the run.
+      let hasSharedMemory = false;
+      try {
+        hasSharedMemory = containsSharedMemory(returned);
+      } catch {
+        hasSharedMemory = false;
+      }
+      if (hasSharedMemory) {
+        lastReason = sharedMemoryFailureMessage;
+        record.error = lastReason;
+      }
     }
 
     if (record.error === null) {
@@ -921,6 +1001,7 @@ async function runBusinessAction(node, binding, implementation, context, actionA
     invoke: implementation,
     createRecord: attempt => ({ nodeId: node.id, attempt, ok: false, error: null, nextDelayMs: 0 }),
     cloneFailureMessage: `operation "${binding.name}" returned a value that cannot be structured-cloned`,
+    sharedMemoryFailureMessage: `operation "${binding.name}" returned a value containing shared memory; independent output isolation cannot be guaranteed`,
     collect: record => actionAttempts.push(record),
     onSuccess: () => {},
   });
@@ -945,6 +1026,7 @@ async function runCompensation(entry, implementation, records) {
       ok: false, error: null, nextDelayMs: 0, result: null,
     }),
     cloneFailureMessage: `compensation "${binding.compensation.name}" returned a value that cannot be structured-cloned`,
+    sharedMemoryFailureMessage: `compensation "${binding.compensation.name}" returned a value containing shared memory; independent output isolation cannot be guaranteed`,
     collect: record => records.push(record),
     onSuccess: (record, returned) => { record.result = returned; },
   });
