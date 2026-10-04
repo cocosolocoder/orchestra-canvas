@@ -298,3 +298,416 @@ test('an entry-unreachable end node with an uncloneable result is still checked'
   };
   assert.throws(() => validateWorkflow(workflow), /end node orphan-end/);
 });
+
+// ---------------------------------------------------------------------------
+// End results whose structured clone retains shared memory
+// ---------------------------------------------------------------------------
+
+// A compensable business action precedes the end: when definition validation
+// rejects the result, that action and its compensation must never be invoked.
+function businessBeforeEndWorkflow(endResult) {
+  return {
+    id: 'business-before-end',
+    entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'early' },
+      {
+        id: 'early', type: 'action', operation: 'opEarly',
+        compensation: { operation: 'undoEarly' }, next: 'finish',
+      },
+      { id: 'finish', type: 'end', result: endResult },
+    ],
+  };
+}
+
+function assertEndSharedMemoryError(error, nodeId = 'finish') {
+  assert.ok(error instanceof Error, 'a definition error (plain Error) is thrown/rejected');
+  assert.ok(!(error instanceof TypeError), 'shared-memory end results are a definition error, not a TypeError');
+  assert.match(error.message, new RegExp(`end node ${nodeId}: result contains shared memory`));
+  assert.match(error.message, /SharedArrayBuffer/);
+  assert.match(error.message, /independent copies cannot be guaranteed/);
+}
+
+// Every result below retains shared memory in the content its structured clone
+// actually saves.
+function sharedResults() {
+  const cyclic = () => {
+    const value = { label: 'self' };
+    value.myself = value;
+    value.shared = new SharedArrayBuffer(2);
+    return value;
+  };
+  const aliased = () => {
+    const shared = new SharedArrayBuffer(2);
+    const holder = { buffer: shared };
+    return { a: holder, b: holder, list: [shared] };
+  };
+  const causeIsNonEnumerable = () => {
+    const error = new Error('wrap', { cause: new Uint8Array(new SharedArrayBuffer(2)) });
+    // The Error constructor installs "cause" as a non-enumerable own
+    // property; it must still count because the clone retains it.
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'cause').enumerable, false);
+    return error;
+  };
+  return [
+    () => new SharedArrayBuffer(4),
+    () => new Uint8Array(new SharedArrayBuffer(4)),
+    () => new Int32Array(new SharedArrayBuffer(8)),
+    () => new Float64Array(new SharedArrayBuffer(8)),
+    () => new BigInt64Array(new SharedArrayBuffer(8)),
+    () => new DataView(new SharedArrayBuffer(4)),
+    () => new Uint8Array(new SharedArrayBuffer(8), 2, 3),
+    () => ({ inner: { bytes: new SharedArrayBuffer(4) } }),
+    () => ({ list: [1, [2, new Uint8Array(new SharedArrayBuffer(4))]] }),
+    () => [new SharedArrayBuffer(4)],
+    () => new Map([['k', new SharedArrayBuffer(4)]]),
+    () => new Map([[new SharedArrayBuffer(4), 'k']]),
+    () => new Map([['k', { view: new DataView(new SharedArrayBuffer(4)) }]]),
+    () => new Set([new SharedArrayBuffer(4)]),
+    () => new Set([{ bytes: new Uint8Array(new SharedArrayBuffer(4)) }]),
+    () => ({ table: new Map([[new Set([new SharedArrayBuffer(4)]), new DataView(new SharedArrayBuffer(4))]]) }),
+    causeIsNonEnumerable,
+    cyclic,
+    aliased,
+  ];
+}
+
+test('validateWorkflow rejects an end result whose clone retains shared memory, naming the end node', () => {
+  for (const make of sharedResults()) {
+    assert.throws(
+      () => validateWorkflow(linearEndWorkflow(make())),
+      error => {
+        assertEndSharedMemoryError(error);
+        return true;
+      },
+    );
+  }
+});
+
+test('cycles and repeated references in an end result never bypass the shared-memory check', () => {
+  // Shared bytes reachable only through a cycle edge.
+  const a = { name: 'a' };
+  const b = { name: 'b' };
+  a.peer = b;
+  b.peer = a;
+  b.bytes = new SharedArrayBuffer(4);
+  assert.throws(() => validateWorkflow(linearEndWorkflow(a)), /end node finish/);
+
+  // The same shared buffer aliased through many slots is still found once.
+  const shared = new SharedArrayBuffer(4);
+  const root = { x: [shared], y: { z: shared } };
+  root.loop = root;
+  assert.throws(() => validateWorkflow(linearEndWorkflow(root)), /result contains shared memory/);
+});
+
+test('the synchronous entry throws the shared-memory definition error before any node executes', () => {
+  for (const make of sharedResults()) {
+    assert.throws(
+      () => executeWorkflow(linearEndWorkflow(make()), {}),
+      error => {
+        assertEndSharedMemoryError(error);
+        return true;
+      },
+    );
+  }
+});
+
+test('the asynchronous entry rejects the returned promise, never reporting action_failed or compensation failure', async () => {
+  let businessCalls = 0;
+  let compensationCalls = 0;
+  const operations = {
+    opEarly: () => { businessCalls += 1; return 'early'; },
+    undoEarly: () => { compensationCalls += 1; return 'undone'; },
+  };
+  for (const make of sharedResults()) {
+    await assert.rejects(
+      () => executeWorkflowAsync(businessBeforeEndWorkflow(make()), {}, operations),
+      error => {
+        assertEndSharedMemoryError(error);
+        return true;
+      },
+    );
+  }
+  assert.equal(businessCalls, 0);
+  assert.equal(compensationCalls, 0);
+});
+
+test('an already-aborted signal does not turn the end-result rejection into a cancelled run', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let businessCalls = 0;
+  await assert.rejects(
+    () => executeWorkflowAsync(
+      businessBeforeEndWorkflow(new SharedArrayBuffer(4)),
+      {},
+      { opEarly: () => { businessCalls += 1; return 'early'; }, undoEarly: () => 'u' },
+      { signal: controller.signal },
+    ),
+    error => {
+      assertEndSharedMemoryError(error);
+      return true;
+    },
+  );
+  assert.equal(businessCalls, 0);
+});
+
+test('shared-memory end results on untaken branches and entry-unreachable end nodes are checked too', () => {
+  const untaken = {
+    id: 'untaken-end-branch', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'choose' },
+      {
+        id: 'choose', type: 'condition',
+        condition: { field: 'route', operator: 'eq', value: 'good' },
+        then: 'good-end', else: 'bad-end',
+      },
+      { id: 'good-end', type: 'end', result: 'good' },
+      { id: 'bad-end', type: 'end', result: { bytes: new SharedArrayBuffer(4) } },
+    ],
+  };
+  assert.throws(() => validateWorkflow(untaken), /end node bad-end/);
+  assert.throws(() => executeWorkflow(untaken, { route: 'good' }), /end node bad-end/);
+
+  const unreachable = {
+    id: 'unreachable-shared-end', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'done' },
+      { id: 'done', type: 'end', result: 'ok' },
+      { id: 'orphan-end', type: 'end', result: new DataView(new SharedArrayBuffer(4)) },
+    ],
+  };
+  assert.throws(() => validateWorkflow(unreachable), /end node orphan-end/);
+});
+
+test('an end result carrying both a function and shared memory reports the cloneability failure first', () => {
+  const workflow = linearEndWorkflow({ fn: () => 'nope', bytes: new SharedArrayBuffer(4) });
+  assert.throws(
+    () => validateWorkflow(workflow),
+    /end node finish: result must be a structured-cloneable value/,
+  );
+});
+
+test('shared bytes in clone-dropped properties (Date/RegExp auxiliaries, non-enumerable and symbol keys) leave the result legal', () => {
+  const symbolKey = Symbol('hidden');
+
+  const date = new Date('2021-06-07T08:09:10.000Z');
+  date.aux = new SharedArrayBuffer(8);
+  class CustomDate extends Date {}
+  const customDate = new CustomDate(0);
+  customDate.aux = new SharedArrayBuffer(8);
+
+  const regexp = /pattern/gi;
+  regexp.aux = new SharedArrayBuffer(8);
+  class CustomRegExp extends RegExp {}
+  const customRegexp = new CustomRegExp('pat');
+  customRegexp.aux = new SharedArrayBuffer(8);
+
+  const plainBuffer = new ArrayBuffer(2);
+  plainBuffer.dropped = new SharedArrayBuffer(2);
+  const view = new Uint8Array([1, 2]);
+  view.dropped = new SharedArrayBuffer(2);
+
+  const errorWithAux = new Error('boom');
+  errorWithAux.details = new SharedArrayBuffer(4);
+
+  const nonEnumerable = {};
+  Object.defineProperty(nonEnumerable, 'hidden', { value: new SharedArrayBuffer(4), enumerable: false });
+
+  const list = ['a', 'b'];
+  Object.defineProperty(list, 'aux', { value: new SharedArrayBuffer(4), enumerable: false });
+  // A non-enumerable index clones as a hole; the dropped bytes never count.
+  const holey = [10, 20, 30];
+  Object.defineProperty(holey, 1, { value: new SharedArrayBuffer(4), enumerable: false, configurable: true });
+
+  const symboled = {};
+  symboled[symbolKey] = new SharedArrayBuffer(4);
+
+  const boxed = new Number(7);
+  boxed.aux = new SharedArrayBuffer(4);
+
+  const result = {
+    date, customDate, regexp, customRegexp, plainBuffer, view,
+    errorWithAux, nonEnumerable, list, holey, symboled, boxed,
+    keep: new Uint8Array([7, 8]),
+  };
+
+  const workflow = linearEndWorkflow(result);
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+
+  const run = executeWorkflow(workflow, {});
+  assert.equal(run.status, 'completed');
+  const saved = run.result;
+  assert.ok(saved.date instanceof Date);
+  assert.ok(saved.customDate instanceof Date);
+  assert.ok(saved.regexp instanceof RegExp);
+  assert.ok(saved.customRegexp instanceof RegExp);
+  assert.equal(saved.date.aux, undefined);
+  assert.equal(saved.customDate.aux, undefined);
+  assert.equal(saved.regexp.aux, undefined);
+  assert.equal(saved.customRegexp.aux, undefined);
+  assert.equal(saved.plainBuffer.dropped, undefined);
+  assert.equal(saved.view.dropped, undefined);
+  assert.equal(saved.errorWithAux.details, undefined);
+  assert.equal(Object.hasOwn(saved.nonEnumerable, 'hidden'), false);
+  assert.equal(Object.hasOwn(saved.list, 'aux'), false);
+  assert.equal(Object.getOwnPropertySymbols(saved.symboled).length, 0);
+  assert.equal(saved.boxed.aux, undefined);
+  assert.deepEqual([...saved.keep], [7, 8]);
+  assert.equal(1 in saved.holey, false);
+
+  // The definition keeps the discarded auxiliary properties untouched.
+  assert.ok(result.date.aux instanceof SharedArrayBuffer);
+  assert.ok(result.plainBuffer.dropped instanceof SharedArrayBuffer);
+});
+
+test('a shared buffer carried only in an Error non-cause own property is dropped and the result is legal', () => {
+  const result = new Error('saved normally');
+  result.info = { bytes: new SharedArrayBuffer(4) };
+  result.cause = 'ordinary cause';
+  const workflow = linearEndWorkflow(result);
+  assert.doesNotThrow(() => validateWorkflow(workflow));
+  const run = executeWorkflow(workflow, {});
+  assert.equal(run.status, 'completed');
+  assert.ok(run.result instanceof Error);
+  assert.equal(run.result.message, 'saved normally');
+  assert.equal(run.result.cause, 'ordinary cause');
+  assert.equal(run.result.info, undefined);
+});
+
+test('an enumerable getter in the end result is read once by the validation clone and judged on that value', () => {
+  let rejectingReads = 0;
+  const sharedFirst = {
+    get flip() {
+      rejectingReads += 1;
+      return rejectingReads === 1 ? new SharedArrayBuffer(4) : 'ordinary';
+    },
+  };
+  assert.throws(() => validateWorkflow(linearEndWorkflow(sharedFirst)), /result contains shared memory/);
+  assert.equal(rejectingReads, 1, 'the getter is read exactly once during validation');
+
+  let acceptedReads = 0;
+  const ordinaryFirst = {
+    get flip() {
+      acceptedReads += 1;
+      return acceptedReads === 1 ? 'ordinary' : new SharedArrayBuffer(4);
+    },
+  };
+  assert.doesNotThrow(() => validateWorkflow(linearEndWorkflow(ordinaryFirst)));
+  assert.equal(acceptedReads, 1, 'the getter is read exactly once during validation');
+});
+
+test('a custom Map/Set iterator in the end result cannot hide real shared members or fabricate shared ones', () => {
+  const hiddenMap = new Map([['real', new SharedArrayBuffer(2)]]);
+  hiddenMap[Symbol.iterator] = function* hidden() { yield ['fake', 1]; };
+  assert.throws(() => validateWorkflow(linearEndWorkflow({ map: hiddenMap })), /shared memory/);
+
+  const emptySet = new Set([new SharedArrayBuffer(2)]);
+  emptySet[Symbol.iterator] = function* empty() {};
+  assert.throws(() => validateWorkflow(linearEndWorkflow({ set: emptySet })), /shared memory/);
+
+  const fabricatedMap = new Map([['real', 1]]);
+  fabricatedMap[Symbol.iterator] = function* fake() { yield ['fabricated', new SharedArrayBuffer(2)]; };
+  const fabricatedSet = new Set([1, 2]);
+  fabricatedSet[Symbol.iterator] = function* fake() { yield new SharedArrayBuffer(2); };
+  for (const value of [{ map: fabricatedMap }, { set: fabricatedSet }]) {
+    const workflow = linearEndWorkflow(value);
+    assert.doesNotThrow(() => validateWorkflow(workflow));
+    const run = executeWorkflow(workflow, {});
+    assert.equal(run.status, 'completed');
+    assert.equal(
+      run.result.map ? run.result.map.get('real') : [...run.result.set].join(','),
+      run.result.map ? 1 : '1,2',
+    );
+  }
+});
+
+test('shared buffers and views produced in another realm are rejected in end results too', async () => {
+  const vm = await import('node:vm');
+  const realm = vm.createContext({});
+  const remote = code => vm.runInContext(code, realm);
+  for (const value of [
+    remote('new SharedArrayBuffer(4)'),
+    remote('new Uint8Array(new SharedArrayBuffer(4))'),
+    remote('new DataView(new SharedArrayBuffer(4))'),
+    { bytes: remote('new Uint8Array(new SharedArrayBuffer(4))') },
+    new Map([['k', remote('new SharedArrayBuffer(4)')]]),
+  ]) {
+    assert.throws(
+      () => validateWorkflow(linearEndWorkflow(value)),
+      /result contains shared memory/,
+    );
+  }
+});
+
+test('a plain ArrayBuffer end result and views over one are copied byte-for-byte and stay independent', () => {
+  const workflow = linearEndWorkflow(Uint8Array.from([9, 8, 7, 6]).buffer);
+  const definitionBuffer = workflow.nodes[1].result;
+
+  const first = executeWorkflow(workflow, {});
+  assert.equal(first.status, 'completed');
+  assert.ok(first.result instanceof ArrayBuffer);
+  assert.ok(!(first.result instanceof SharedArrayBuffer));
+  assert.notEqual(first.result, definitionBuffer);
+  assert.deepEqual([...new Uint8Array(first.result)], [9, 8, 7, 6]);
+
+  // Rewriting the returned bytes cannot reach the definition.
+  new Uint8Array(first.result).fill(1);
+  assert.deepEqual([...new Uint8Array(definitionBuffer)], [9, 8, 7, 6]);
+
+  // A second run gets its own copy of the untouched configured bytes.
+  const second = executeWorkflow(workflow, {});
+  assert.deepEqual([...new Uint8Array(second.result)], [9, 8, 7, 6]);
+  assert.notEqual(second.result, first.result);
+  assert.notEqual(second.result, definitionBuffer);
+});
+
+test('typed-view end results keep their type and bytes and do not share storage', () => {
+  const workflow = linearEndWorkflow(new Uint16Array([258, 1000]));
+  const definitionView = workflow.nodes[1].result;
+
+  const run = executeWorkflow(workflow, {});
+  assert.ok(run.result instanceof Uint16Array);
+  assert.notEqual(run.result, definitionView);
+  assert.notEqual(run.result.buffer, definitionView.buffer);
+  assert.deepEqual([...run.result], [258, 1000]);
+
+  run.result[0] = 0;
+  assert.equal(definitionView[0], 258);
+  assert.deepEqual([...executeWorkflow(workflow, {}).result], [258, 1000]);
+});
+
+test('structured legal end results preserve types, bytes and circular/repeated references', async () => {
+  const bytes = new ArrayBuffer(4);
+  new Uint8Array(bytes).set([1, 2, 3, 4]);
+  const view = new Uint16Array(new ArrayBuffer(4));
+  new Uint8Array(view.buffer).set([5, 6, 7, 8]);
+  const detail = { id: 'detail' };
+  const result = {
+    bytes, view, detail, when: new Date('2020-02-03T04:05:06.000Z'), pattern: /ok/gi,
+  };
+  result.self = result;
+  result.again = detail;
+  result.list = [detail];
+
+  const assertSaved = saved => {
+    assert.ok(saved.bytes instanceof ArrayBuffer);
+    assert.notEqual(saved.bytes, bytes);
+    assert.ok(saved.view instanceof Uint16Array);
+    assert.notEqual(saved.view.buffer, view.buffer);
+    assert.deepEqual([...new Uint8Array(saved.bytes)], [1, 2, 3, 4]);
+    assert.deepEqual([...new Uint8Array(saved.view.buffer)], [5, 6, 7, 8]);
+    assert.ok(saved.when instanceof Date);
+    assert.ok(saved.pattern instanceof RegExp);
+    assert.equal(saved.self, saved);
+    assert.equal(saved.again, saved.detail);
+    assert.equal(saved.list[0], saved.detail);
+  };
+
+  const workflow = linearEndWorkflow(result);
+  assertSaved(executeWorkflow(workflow, {}).result);
+  assertSaved((await executeWorkflowAsync(workflow, {})).result);
+
+  // The definition and the caller's objects are never mutated.
+  assert.equal(workflow.nodes[1].result, result);
+  assert.equal(workflow.nodes[1].result.bytes, bytes);
+});

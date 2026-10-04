@@ -432,12 +432,27 @@ function compileAction(node) {
 // symbol, getter-built object the clone algorithm rejects, etc.) nested in a
 // result object/array is a definition error naming the end node and reason;
 // bare function results cannot be delivered through JSON-style results either.
+//
+// Cloneability alone is not enough: structured cloning a SharedArrayBuffer (or
+// a typed array / DataView backed by one) "succeeds" while the clone keeps
+// sharing the underlying bytes with the definition's result, so the caller
+// could rewrite the returned bytes and silently change the definition and
+// every later run — the promised independent copy could not be delivered.
+// As with legacy messages, run inputs and operation returns, the clone is
+// therefore produced first and judged with containsSharedMemory: only shared
+// memory the clone actually retains condemns the result (an attached property
+// of a Date/RegExp, a non-enumerable or symbol-keyed property, an Error own
+// property other than cause are discarded by the clone and never inspected).
 function compileEndResult(node) {
   if (!Object.hasOwn(node, 'result') || node.result === undefined) return;
+  let cloned;
   try {
-    structuredClone(node.result);
+    cloned = structuredClone(node.result);
   } catch {
     throw new Error(`end node ${node.id}: result must be a structured-cloneable value (objects and arrays must not contain functions)`);
+  }
+  if (containsSharedMemory(cloned)) {
+    throw new Error(`end node ${node.id}: result contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this end result is not supported`);
   }
 }
 
@@ -1354,9 +1369,10 @@ function advanceSchedule(state) {
     // recorded value is this run's independent copy, so later mutation of
     // the definition's result (during a wait on another activated branch),
     // of another run's result, or of the returned value cannot reach back
-    // here. Validation already guarantees cloneability, so this cannot
-    // throw mid-run. An unset or null result stays null; 0, false and ""
-    // pass through ?? untouched (only null/undefined default to null).
+    // here. Validation already guarantees cloneability and that the clone
+    // retains no shared memory, so this cannot throw mid-run. An unset or
+    // null result stays null; 0, false and "" pass through ?? untouched
+    // (only null/undefined default to null).
     state.endReached = true;
     state.endResult = structuredClone(ready.result ?? null);
     state.completed.add(ready.id);
