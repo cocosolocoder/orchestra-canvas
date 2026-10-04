@@ -848,13 +848,17 @@ const DATAVIEW_BUFFER_GETTER = Object.getOwnPropertyDescriptor(DataView.prototyp
 //
 // This walks exactly the graph the structured clone algorithm would traverse
 // (string-keyed own enumerable properties of plain objects and arrays —
-// including non-index properties on arrays — Map keys and values, Set members,
-// and Error "cause"), so the rejection is consistent wherever the shared
-// memory sits: a bare SharedArrayBuffer, a byte view over one, or bytes nested
-// inside objects, arrays, Maps (key or value) or Sets. A plain ArrayBuffer and
-// its views are accepted; circular and repeated references are visited once
-// via the same identity set the clone would use, so legal graphs' reference
-// relationships are unaffected by the check itself.
+// including enumerable non-index properties on arrays — Map keys and values,
+// Set members, and Error "cause"), so the rejection is consistent wherever
+// the shared memory sits: a bare SharedArrayBuffer, a byte view over one, or
+// bytes nested inside objects, arrays, Maps (key or value) or Sets. Content
+// the clone drops — a Date's or RegExp's own properties, an array's
+// non-enumerable properties, symbol-keyed properties — never reaches the
+// saved output, so shared memory sitting only there does not fail the
+// attempt. A plain ArrayBuffer and its views are accepted; circular and
+// repeated references are visited once via the same identity set the clone
+// would use, so legal graphs' reference relationships are unaffected by the
+// check itself.
 //
 // Classification uses Node's internal-slot brand checks (util.types): they
 // recognize buffers, views, containers and errors constructed in another realm
@@ -936,18 +940,26 @@ function containsSharedMemory(value) {
 
     if (Array.isArray(current)) {
       // Indexed slots plus enumerable own string-keyed non-index properties,
-      // exactly as structuredClone treats arrays.
+      // exactly as structuredClone treats arrays: Object.keys yields precisely
+      // the enumerable string keys (indices included), while non-enumerable
+      // and symbol-keyed properties are dropped by the clone and skipped here.
       let keys;
       try {
-        keys = Reflect.ownKeys(current);
+        keys = Object.keys(current);
       } catch {
         keys = [];
       }
       for (const key of keys) {
-        if (typeof key !== 'string') continue;
         const [exists, child] = read(current, key);
         if (exists) pushIfObject(child);
       }
+      continue;
+    }
+
+    if (nodeTypes.isDate(current) || nodeTypes.isRegExp(current)) {
+      // A Date clones to its timestamp and a RegExp to its source, flags and
+      // lastIndex; every own property attached to either is dropped by the
+      // clone, so nothing on them participates in the saved value.
       continue;
     }
 
@@ -987,9 +999,9 @@ function containsSharedMemory(value) {
       continue;
     }
 
-    // Plain objects (any prototype), Date, RegExp and other
-    // structured-cloneable leaf objects: only own enumerable string-keyed
-    // properties participate in the clone. Symbol-keyed and non-enumerable
+    // Plain objects (any prototype) and other structured-cloneable objects
+    // whose own enumerable properties survive the clone: only own enumerable
+    // string-keyed properties participate. Symbol-keyed and non-enumerable
     // properties are skipped exactly as structuredClone skips them.
     let keys;
     try {
