@@ -517,8 +517,153 @@ test('boxed primitive leaves with attached shared bytes succeed without the atta
 });
 
 // ---------------------------------------------------------------------------
+// Isolation is judged on the cloned (saved) value, not on the source object
+// ---------------------------------------------------------------------------
+
+test('an enumerable getter is read exactly once per attempt; the saved value is that single read', async () => {
+  let reads = 0;
+  const returned = {};
+  Object.defineProperty(returned, 'x', {
+    enumerable: true,
+    // The cloning read gets a plain number; any later read would hand out
+    // shared memory. The isolation check must not perform that second read.
+    get() { reads += 1; return reads === 1 ? 7 : new Uint8Array(new SharedArrayBuffer(4)); },
+  });
+  const execution = await executeWorkflowAsync(workflow({ retry: ZERO_DELAY_RETRY }), {}, {
+    opA: () => 'A',
+    opB: () => returned,
+    undoA: () => 'undone',
+  });
+  assert.equal(execution.status, 'completed');
+  assert.equal(reads, 1, 'the isolation check must not read the getter beyond the clone');
+  assert.equal(execution.context.output.b.x, 7);
+  const bRecords = execution.actionAttempts.filter(r => r.nodeId === 'b');
+  assert.deepEqual(bRecords.map(r => [r.attempt, r.ok]), [[1, true]]);
+});
+
+test('a getter yielding shared memory on the cloning read fails the attempt', async () => {
+  let reads = 0;
+  const returned = {};
+  Object.defineProperty(returned, 'x', {
+    enumerable: true,
+    get() { reads += 1; return reads === 1 ? new Uint8Array(new SharedArrayBuffer(4)) : 7; },
+  });
+  const execution = await executeWorkflowAsync(workflow(), {}, {
+    opA: () => 'A',
+    opB: () => returned,
+    undoA: () => 'undone',
+  });
+  assert.equal(execution.status, 'action_failed');
+  assertSharedMemoryError(execution.error);
+  assert.equal(reads, 1);
+  assert.equal(Object.hasOwn(execution.context.output, 'b'), false);
+});
+
+test('a getter on an array element position follows the same single-read rule', async () => {
+  let reads = 0;
+  const returned = [1, 2];
+  Object.defineProperty(returned, '0', {
+    enumerable: true,
+    get() { reads += 1; return reads === 1 ? 9 : new DataView(new SharedArrayBuffer(2)); },
+  });
+  const execution = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
+    opA: () => 'A',
+    opB: () => returned,
+  });
+  assert.equal(execution.status, 'completed');
+  assert.equal(reads, 1);
+  assert.deepEqual([...execution.context.output.b], [9, 2]);
+});
+
+test('Map/Set custom iterators can neither hide real shared members nor fabricate ones', async () => {
+  // Real members contain shared memory; a rewritten iterator yields nothing
+  // or throws — the saved content still holds the shared bytes and fails.
+  const hiddenMap = new Map([['k', new SharedArrayBuffer(4)]]);
+  hiddenMap[Symbol.iterator] = function* () {};
+  const throwingSet = new Set([new Uint8Array(new SharedArrayBuffer(4))]);
+  throwingSet[Symbol.iterator] = function* () { throw new Error('nothing here'); };
+  const hiddenKeyMap = new Map([[new SharedArrayBuffer(4), 'v']]);
+  hiddenKeyMap[Symbol.iterator] = function* () {};
+  for (const impl of [() => hiddenMap, () => throwingSet, () => hiddenKeyMap]) {
+    const execution = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
+      opA: () => 'A',
+      opB: impl,
+    });
+    assert.equal(execution.status, 'action_failed', 'hidden real shared memory must still fail');
+    assertSharedMemoryError(execution.error);
+    assert.equal(Object.hasOwn(execution.context.output, 'b'), false);
+  }
+
+  // Real members are ordinary; a rewritten iterator fabricates shared
+  // memory the container does not hold — the saved content stays clean.
+  const ordinaryMap = new Map([['k', 'ordinary']]);
+  ordinaryMap[Symbol.iterator] = function* () { yield ['evil', new SharedArrayBuffer(4)]; };
+  const ordinarySet = new Set(['real']);
+  ordinarySet[Symbol.iterator] = function* () { yield new SharedArrayBuffer(4); };
+  for (const impl of [() => ordinaryMap, () => ordinarySet]) {
+    const execution = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
+      opA: () => 'A',
+      opB: impl,
+    });
+    assert.equal(execution.status, 'completed', 'fabricated shared memory must not reject ordinary members');
+  }
+  const mapRun = await executeWorkflowAsync(workflow(null, { aCompensation: null }), {}, {
+    opA: () => 'A',
+    opB: () => ordinaryMap,
+  });
+  assert.ok(mapRun.context.output.b instanceof Map);
+  assert.deepEqual([...mapRun.context.output.b], [['k', 'ordinary']]);
+});
+
+// ---------------------------------------------------------------------------
 // Compensation returns follow the same rule
 // ---------------------------------------------------------------------------
+
+test('a compensation getter is read once and the saved result is that single read', async () => {
+  let reads = 0;
+  const returned = {};
+  Object.defineProperty(returned, 'x', {
+    enumerable: true,
+    get() { reads += 1; return reads === 1 ? 7 : new Uint8Array(new SharedArrayBuffer(4)); },
+  });
+  const execution = await executeWorkflowAsync(compensationFailureWorkflow(), {}, {
+    opA: () => 'A',
+    opB: () => 'B',
+    opC: () => { throw new Error('c-boom'); },
+    undoA: () => 'ua',
+    undoB: () => returned,
+  });
+  assert.equal(execution.status, 'action_failed');
+  assert.equal(execution.compensationStatus, 'completed');
+  assert.equal(reads, 1);
+  const undoB = execution.compensationAttempts.find(r => r.nodeId === 'b');
+  assert.equal(undoB.ok, true);
+  assert.deepEqual(undoB.result, { x: 7 });
+});
+
+test('a compensation Map whose custom iterator hides real shared members still fails', async () => {
+  const hiddenMap = new Map([['k', new SharedArrayBuffer(4)]]);
+  hiddenMap[Symbol.iterator] = function* () {};
+  const execution = await executeWorkflowAsync(compensationFailureWorkflow(), {}, {
+    opA: () => 'A',
+    opB: () => 'B',
+    opC: () => { throw new Error('c-boom'); },
+    undoA: () => 'ua',
+    undoB: () => hiddenMap,
+  });
+  assert.equal(execution.status, 'action_failed');
+  assert.equal(execution.error, 'c-boom');
+  assert.equal(execution.compensationStatus, 'failed');
+  const undoBRecords = execution.compensationAttempts.filter(r => r.nodeId === 'b');
+  assert.deepEqual(undoBRecords.map(r => [r.attempt, r.ok, r.result]), [
+    [1, false, null], [2, false, null],
+  ]);
+  for (const record of undoBRecords) assertSharedMemoryError(record.error);
+  // The earlier compensation still runs afterwards.
+  const undoA = execution.compensationAttempts.find(r => r.nodeId === 'a');
+  assert.equal(undoA.ok, true);
+  assert.equal(undoA.result, 'ua');
+});
 
 test('a compensation returning a Date/array whose dropped properties hold shared memory succeeds once with an independent result', async () => {
   let undoCalls = 0;

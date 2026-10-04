@@ -846,14 +846,27 @@ const DATAVIEW_BUFFER_GETTER = Object.getOwnPropertyDescriptor(DataView.prototyp
 // every saved output is an independent copy. Such a return value is therefore
 // explicitly unsupported and fails the attempt.
 //
-// This walks exactly the graph the structured clone algorithm would actually
-// *save*, so the rejection matches the cloned value rather than the source
-// object:
+// This runs on the value *after* structuredClone — i.e. on exactly the graph
+// the engine is about to save, never on the object the implementation
+// returned. Judging the clone rather than the source is what keeps the
+// verdict aligned with the saved content:
+// - an enumerable getter is read exactly once per attempt, by the clone
+//   itself; the check inspects the stored outcome of that single read and
+//   never triggers a second read that could observe a different value;
+// - a cloned Map/Set holds the container's real members (the clone reads
+//   internal slots, ignoring any custom iterator), so a rewritten or
+//   throwing iterator can neither hide real shared memory nor fabricate
+//   members the saved value does not have;
+// - properties the clone discarded (non-enumerable or symbol-keyed
+//   properties, own properties of Dates, RegExps, boxed primitives, byte
+//   views and buffers, an Error's own properties other than "cause") are
+//   simply absent here, so shared memory stashed only in them can no
+//   longer fail the attempt.
+//
+// Within the cloned graph the walk matches what structuredClone saves:
 // - plain objects, arrays and arbitrary class instances contribute only
-//   own enumerable string-keyed properties (Object.keys) — symbol-keyed and
-//   non-enumerable properties are skipped exactly as the clone skips them;
-//   this includes array indices (a non-enumerable index clones as a hole)
-//   and enumerable non-index array properties, which do survive;
+//   own enumerable string-keyed properties (Object.keys) — this includes
+//   array indices and enumerable non-index array properties;
 // - Map keys and values and Set members are walked;
 // - an Error's "cause" is walked whether enumerable or not (it is the one
 //   non-enumerable the clone preserves), while the Error's other own
@@ -861,12 +874,12 @@ const DATAVIEW_BUFFER_GETTER = Object.getOwnPropertyDescriptor(DataView.prototyp
 // - Date and RegExp (including subclasses) clone only their internal
 //   value/pattern, boxed primitives only their primitive, and Blob/File,
 //   DOMException and web CryptoKey only their internal slots — every own
-//   property attached to them is discarded, so shared memory stashed there is
-//   never part of the saved value and must not fail the attempt;
+//   property attached to them is discarded, so shared memory stashed there
+//   is never part of the saved value and must not fail the attempt;
 // - a SharedArrayBuffer itself, or a byte view whose true internal-slot
 //   buffer is one, fails wherever the clone reaches it.
 // A plain ArrayBuffer and its views are accepted; circular and repeated
-// references are visited once via the same identity set the clone would use,
+// references are visited once via the same identity set the clone used,
 // so legal graphs' reference relationships are unaffected by the check.
 //
 // Classification uses Node's internal-slot brand checks (util.types): they
@@ -874,13 +887,11 @@ const DATAVIEW_BUFFER_GETTER = Object.getOwnPropertyDescriptor(DataView.prototyp
 // primitives constructed in another realm and reject objects merely faking
 // the right @@toStringTag, which tag matching alone could not. Host-object
 // leaves (DOMException, Blob/File, CryptoKey) are recognized with guarded
-// instanceof checks — instanceof drives prototype traps and can throw on a
-// revoked proxy. DOMException is checked before the native-error branch:
-// util.types brands it as an Error, but unlike a real Error its "cause" is
-// not cloned. Every other possibly observable access is guarded too: a return
-// value that throws while inspected (a revoked proxy, a trap/getter that
-// throws) yields only the edges that could be read, and the structuredClone
-// step that follows reports it in the usual way — this check never throws.
+// instanceof checks; DOMException must be classified before the native-error
+// branch because util.types brands it as an Error, yet unlike a real Error
+// its "cause" is not cloned. A clone never contains proxies, getters or
+// custom iterators, so the guarded reads below are pure defense in depth —
+// this check never throws, whatever value it is handed.
 const HOST_LEAF_CONSTRUCTORS = [
   // DOMException must precede the native-error branch (see above).
   typeof DOMException === 'function' ? DOMException : null,
@@ -1127,11 +1138,6 @@ async function runWithRetries({
       record.error = lastReason;
     }
 
-    if (record.error === null && containsSharedMemory(returned)) {
-      lastReason = sharedMemoryFailureMessage;
-      record.error = lastReason;
-    }
-
     if (record.error === null) {
       try {
         returned = structuredClone(returned);
@@ -1139,6 +1145,22 @@ async function runWithRetries({
         lastReason = cloneFailureMessage;
         record.error = lastReason;
       }
+    }
+
+    // Isolation is judged on the value exactly as it would be saved — the
+    // clone produced above, which is also the only read of the returned
+    // graph this attempt performs. An enumerable getter is therefore
+    // invoked exactly once (by the clone itself): a getter that yields a
+    // plain value on that read is saved with that value even if a later
+    // read would hand out shared memory, and one that yields shared memory
+    // on the cloning read is caught here. Likewise a cloned Map/Set always
+    // carries the container's real members (structuredClone reads the
+    // internal slots, never a custom iterator), so members a rewritten or
+    // throwing iterator tries to hide are still inspected, and "members"
+    // such an iterator merely fabricates are never seen.
+    if (record.error === null && containsSharedMemory(returned)) {
+      lastReason = sharedMemoryFailureMessage;
+      record.error = lastReason;
     }
 
     if (record.error === null) {
