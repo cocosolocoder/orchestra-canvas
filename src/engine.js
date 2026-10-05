@@ -403,203 +403,177 @@ function compileAction(node) {
     compensation = { name: config.operation, retry: compRetry };
   }
 
-  // A legacy message action (no operation) may carry a structured object or
-  // array as its message, and the output it saves is snapshotted per run. A
-  // value the structured clone algorithm cannot deliver — a bare function or
-  // a function nested inside an object/array — is a definition error naming
-  // the action and the reason, for every message action including actions on
-  // untaken branches and entry-unreachable ones. An action that names an
-  // operation ignores its message entirely, so an unused uncloneable message
-  // is never rejected for it.
-  //
-  // A value that clones but whose clone retains shared memory is rejected for
-  // the same reason the run input and operation return values are: cloning a
-  // SharedArrayBuffer (or a typed array / DataView backed by one) "succeeds"
-  // while the clone keeps sharing the underlying bytes, so the independent
-  // output copy the action promises — including against the definition's own
-  // message, which the engine clones again at execution time — could not be
-  // guaranteed. The check therefore runs on the cloned value with the same
-  // clone-shaped traversal (containsSharedMemory): shared memory placed only
-  // where cloning drops it (an attached property of a Date/RegExp, a
-  // non-enumerable property, an Error own property other than cause) is
-  // discarded with that property and never condemns the message.
-  //
-  // Validation only proves the message was safe as it was then; the same two
-  // checks are re-enforced at the action's own execution moment by
-  // captureActionMessage below, exactly as for end-node results.
-  if (name === null && Object.hasOwn(node, 'message') && node.message !== undefined) {
-    let cloned;
-    try {
-      cloned = structuredClone(node.message);
-    } catch {
-      throw new Error(ACTION_MESSAGE_UNCLONEABLE_MESSAGE(node.id));
-    }
-    if (containsSharedMemory(cloned)) {
-      throw new Error(ACTION_MESSAGE_SHARED_MEMORY_MESSAGE(node.id));
-    }
+  // A legacy message action (no operation) is validated through the single
+  // configured-value gate (assertConfiguredCopy below) — the same rule, with
+  // action-specific wording, that end-node results use — covering every
+  // message action including ones on untaken branches and entry-unreachable
+  // ones. An action that names an operation ignores its message entirely, so
+  // an unused uncloneable or shared-memory message is never rejected for it.
+  // The gate only proves the message was safe as it was then; the same rule
+  // is re-enforced at the action's own execution moment by readConfiguredCopy.
+  if (name === null) {
+    assertConfiguredCopy(node, 'message', ACTION_MESSAGE_COPY_ERRORS);
   }
 
   return { name, retry, compensation };
 }
 
-// The two failure kinds a legacy message can produce, shared by definition
-// validation (compileAction above) and the execution-time capture
-// (captureActionMessage below): the message cannot be structured-cloned at
+// The two failure kinds a node-configured value can produce, shared by
+// definition validation (assertConfiguredCopy below) and the execution-time
+// capture (readConfiguredCopy below): the value cannot be structured-cloned at
 // all, or it clones but the clone retains shared memory. Uncloneability takes
-// precedence when a message carries both, at both moments.
-const ACTION_MESSAGE_UNCLONEABLE_MESSAGE = nodeId =>
-  `action node ${nodeId}: message must be a structured-cloneable value (objects and arrays must not contain functions)`;
-const ACTION_MESSAGE_SHARED_MEMORY_MESSAGE = nodeId =>
-  `action node ${nodeId}: message contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so shared bytes must not enter the action output`;
+// precedence when a value carries both, at both moments. Each node kind keeps
+// its own wording — an action's message and an end node's result fail with the
+// node-specific text the entries already exposed — and its own default for a
+// value that is absent, undefined or null (action:<node id> for a legacy
+// message; null for an end result), while "", 0 and false pass through
+// untouched for both.
+const ACTION_MESSAGE_COPY_ERRORS = {
+  uncloneable: nodeId =>
+    `action node ${nodeId}: message must be a structured-cloneable value (objects and arrays must not contain functions)`,
+  sharedMemory: nodeId =>
+    `action node ${nodeId}: message contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so shared bytes must not enter the action output`,
+};
+const END_RESULT_COPY_ERRORS = {
+  uncloneable: nodeId =>
+    `end node ${nodeId}: result must be a structured-cloneable value (objects and arrays must not contain functions)`,
+  sharedMemory: nodeId =>
+    `end node ${nodeId}: result contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this end result is not supported`,
+};
 
-// Reads a legacy message action's configured message at the action's own
-// execution moment and produces the independent copy that will be saved as
-// the node's output. This re-enforces, for exactly the content this run is
-// about to save, the promise validation already made for the message as it
-// was then: an enumerable getter can return ordinary data during validation
-// and shared memory (or a function) when the action later runs, and a
-// preceding business operation — or work on another activated branch — can
-// replace a message's plain buffer with a shared one before this action
-// executes.
+// The single independent-copy rule for a value a node configures — a legacy
+// action's `message` and an end node's `result` both go through here, so the
+// cloneability and retained-shared-memory rules are maintained in exactly one
+// place and the two node kinds can never drift apart. It is invoked at two
+// moments, and each moment keeps its original root-read protocol:
 //
-//   - the root message is read exactly once here, and every nested enumerable
-//     accessor is read only by structuredClone's own read — there is no
-//     separate inspection pass over the original, so a getter's return order
-//     is never disturbed, and the value this read produced is both what is
-//     judged and what is saved (a legal message whose getter answers with a
-//     different ordinary value at execution time saves that fresh value);
-//   - shared memory the clone retains is rejected (containsSharedMemory runs
-//     on the clone), while shared memory placed only where cloning drops it
-//     is discarded with that property and never condemns the message;
-//   - uncloneability takes precedence over shared memory, matching
-//     validation: the clone is attempted first and its failure short-circuits
-//     before the shared-memory traversal. A root getter that throws, a nested
-//     getter that throws while the clone reads it, and a value that cannot be
-//     cloned at all (a function) all surface as the same uncloneable error.
+//  1. At validation time (assertConfiguredCopy), for every such node in the
+//     definition — including nodes on untaken branches and nodes the entry
+//     cannot reach — so a statically invalid value is rejected before any
+//     node, business operation or compensation can run. An absent own
+//     property is not read at all; the gate performs the first root read and
+//     only an own, defined value reaches the clone, which performs the root's
+//     second read itself (a throwing root accessor propagates from the gate
+//     exactly as before).
+//  2. At the node's own execution moment (readConfiguredCopy), against the
+//     value actually about to be saved: the root is read exactly once and the
+//     value that read produced is cloned, so validation cannot pin the result
+//     — an enumerable getter's later answer and a preceding business
+//     operation's or another activated branch's mutation are both captured.
 //
-// An unset, undefined or null message still defaults to action:<node id>,
-// while "", 0 and false pass through untouched.
+// At either moment every nested enumerable accessor is read only by
+// structuredClone's own read — there is no separate inspection pass over the
+// original, so a getter's return order is never disturbed and the value the
+// clone's read produced is both what is judged and what is saved (a legal
+// value whose getter answers with a different ordinary value at execution
+// time records that fresh value rather than the stale validation-time one). A
+// root getter that throws on execution's single read, a nested getter that
+// throws while the clone reads it, and a value that cannot be cloned at all
+// (a bare function) all surface as the same uncloneable error.
 //
-// Any failure is thrown here as an ordinary Error naming the action node
+// The clone is produced first and judged with containsSharedMemory: only
+// shared memory the clone actually retains condemns the value (an attached
+// property of a Date/RegExp, a non-enumerable or symbol-keyed property, an
+// Error own property other than cause are discarded by the clone and never
+// inspected); a custom Map/Set Symbol.iterator can neither hide the
+// container's real members nor fabricate shared ones. Uncloneability takes
+// precedence over shared memory: the clone attempt short-circuits before the
+// shared-memory traversal.
+//
+// Any failure is thrown as an ordinary Error naming the node (errors[kind])
 // rather than recorded as a run status: the synchronous entry propagates it
 // and the asynchronous entry's rejected Promise carries it. It is never an
-// action_failed — a legacy message action has no retry budget — and it
-// neither consumes business-action retries nor triggers compensation, and no
-// success output is recorded for the node.
-function captureActionMessage(node) {
-  let message;
-  try {
-    // The root value's single read: an absent, undefined or null message
-    // takes the default; a root getter that throws is the uncloneable error.
-    message = node.message;
-  } catch {
-    throw new Error(ACTION_MESSAGE_UNCLONEABLE_MESSAGE(node.id));
+// action_failed — neither node kind has a retry budget — it neither consumes
+// business-action retries nor triggers compensation, and no output/result is
+// recorded for the node. At execution, an absent, undefined or null value
+// becomes `absentValue` (action:<node id> for messages, null for results),
+// while "", 0 and false pass through untouched.
+function configuredCopy(node, property, errors, options) {
+  const validation = options !== undefined && options.validation === true;
+
+  if (validation) {
+    // Preserve the validation gate exactly: no read at all for a missing own
+    // property, one unguarded gate read (a throwing root accessor propagates
+    // raw, as the former per-node gates did), and an undefined value is left
+    // to execution. The structuredClone argument evaluation is the root's
+    // second — and final — read this moment; the clone itself traverses that
+    // captured value (firing nested getters once), so no read the original
+    // gate made is added or removed.
+    if (!Object.hasOwn(node, property)) return;
+    const gated = node[property];
+    if (gated === undefined) return;
+    let cloned;
+    try {
+      cloned = structuredClone(node[property]);
+    } catch {
+      throw new Error(errors.uncloneable(node.id));
+    }
+    if (containsSharedMemory(cloned)) {
+      throw new Error(errors.sharedMemory(node.id));
+    }
+    return;
   }
-  if (message === undefined || message === null) return `action:${node.id}`;
+
+  // Execution: the root value's single read. An absent, undefined or null
+  // value takes the node kind's default (action:<node id> for messages, null
+  // for results) without reaching structuredClone; a root getter that throws
+  // on this read is the uncloneable error.
+  const { absentValue } = options;
+  let value;
+  try {
+    value = node[property];
+  } catch {
+    throw new Error(errors.uncloneable(node.id));
+  }
+  if (value === undefined || value === null) return absentValue;
+
   let cloned;
   try {
-    cloned = structuredClone(message);
+    // Clone the value the single read captured — the root is not read again —
+    // so every nested enumerable accessor is read only by the clone's own
+    // read and this, the execution-moment value, is both judged and saved.
+    cloned = structuredClone(value);
   } catch {
-    throw new Error(ACTION_MESSAGE_UNCLONEABLE_MESSAGE(node.id));
+    throw new Error(errors.uncloneable(node.id));
   }
   if (containsSharedMemory(cloned)) {
-    throw new Error(ACTION_MESSAGE_SHARED_MEMORY_MESSAGE(node.id));
+    throw new Error(errors.sharedMemory(node.id));
   }
   return cloned;
 }
 
-// An end node's result is delivered to the caller verbatim for primitives
-// (null, undefined, strings, numbers, booleans), but an object or array result
-// must be structured-clonable. The independent-copy promise is enforced at
-// BOTH moments it can be observed:
+// Validation gate: reject a statically uncopyable configured value. Nothing
+// is returned — validation saves no value; the execution-time capture reads
+// the value afresh when the node actually runs.
+function assertConfiguredCopy(node, property, errors) {
+  configuredCopy(node, property, errors, { validation: true });
+}
+
+// Execution-time capture: the independent copy this run actually saves, taken
+// from the value read at this node's own execution moment. `absentValue` is
+// the node's default for an unset/undefined/null value.
+function readConfiguredCopy(node, property, errors, absentValue) {
+  return configuredCopy(node, property, errors, { validation: false, absentValue });
+}
+
+// End-node results use the same single configured-value rule as legacy
+// messages, with end-node wording and a null default:
 //
-//  1. At validation time (compileEndResult below), for every end node in the
+//  1. compileEndResult is the validation gate for every end node in the
 //     definition — including nodes on untaken branches and nodes the entry
 //     cannot reach — so a statically invalid result is rejected before any
 //     node can run.
-//  2. At the end node's own execution moment (captureEndResult), against the
-//     value actually about to be recorded: validation cannot see what an
-//     enumerable getter returns on its later read, nor what a preceding
-//     business operation or another activated branch does to the configured
-//     result before this end runs. Only the content this run will save is
-//     judged.
-//
-// The two failure kinds, in priority order: a value that cannot be
-// structured-cloned (a bare function, a function nested in an object/array, a
-// getter that throws, etc.), and a value that clones but whose clone retains
-// shared memory — cloning a SharedArrayBuffer (or a typed array / DataView
-// backed by one) "succeeds" while the clone keeps sharing the underlying
-// bytes, so the caller could rewrite the returned bytes and silently change
-// the definition and every later run. Uncloneability takes precedence when a
-// result carries both. As with legacy messages, run inputs and operation
-// returns, the clone is produced first and judged with containsSharedMemory:
-// only shared memory the clone actually retains condemns the result (an
-// attached property of a Date/RegExp, a non-enumerable or symbol-keyed
-// property, an Error own property other than cause are discarded by the clone
-// and never inspected).
-const END_RESULT_UNCLONEABLE_MESSAGE = nodeId =>
-  `end node ${nodeId}: result must be a structured-cloneable value (objects and arrays must not contain functions)`;
-const END_RESULT_SHARED_MEMORY_MESSAGE = nodeId =>
-  `end node ${nodeId}: result contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this end result is not supported`;
-
+//  2. captureEndResult produces, at the end node's own execution moment, the
+//     independent copy that is recorded and returned: an unset, undefined or
+//     null result becomes null, while 0, false and "" pass through, and a
+//     legal ordinary change made before the end executes is recorded from the
+//     fresh value rather than the validation-time one.
 function compileEndResult(node) {
-  if (!Object.hasOwn(node, 'result') || node.result === undefined) return;
-  let cloned;
-  try {
-    cloned = structuredClone(node.result);
-  } catch {
-    throw new Error(END_RESULT_UNCLONEABLE_MESSAGE(node.id));
-  }
-  if (containsSharedMemory(cloned)) {
-    throw new Error(END_RESULT_SHARED_MEMORY_MESSAGE(node.id));
-  }
+  assertConfiguredCopy(node, 'result', END_RESULT_COPY_ERRORS);
 }
 
-// Reads the end node's configured result at the node's own execution moment
-// and produces the independent copy that will be recorded and returned. This
-// re-enforces, for exactly the content this run is about to save, the promise
-// validation already made for the value as it was then:
-//
-//   - the value is read exactly once here, via structuredClone's own read.
-//     There is no separate inspection pass over the original, so an
-//     enumerable getter's return order is never disturbed (the clone is the
-//     only read), and a getter that returned ordinary data during validation
-//     but returns shared memory — or a function — when this end executes is
-//     caught on the value that would actually have been saved;
-//   - shared memory the clone retains is rejected (containsSharedMemory runs
-//     on the clone), while shared memory placed only where cloning drops it
-//     is discarded with that property and never condemns an otherwise-legal
-//     result.
-//
-// Uncloneability takes precedence over shared memory, matching validation:
-// the clone is attempted first and its failure short-circuits before the
-// shared-memory traversal. An unset, undefined or null result still becomes
-// null (structuredClone(null) === null), while 0, false and "" pass through.
-//
-// Any failure is thrown here as an ordinary Error naming the end node rather
-// than recorded as a run status: the synchronous entry propagates it and the
-// asynchronous entry's rejected Promise carries it. It is never an
-// action_failed — the end node has no retry budget — and it neither consumes
-// business-action retries nor triggers compensation, and no "completed"
-// result is produced.
 function captureEndResult(node) {
-  let cloned;
-  try {
-    // `node.result ?? null` is the root value's single read (an unset,
-    // undefined or null result becomes null; 0, false and "" pass through);
-    // every nested enumerable accessor is read only by structuredClone, so
-    // this never adds a read that could change a getter's return order. A
-    // root getter that throws, a nested/root getter that throws while the
-    // clone reads it, and a value that cannot be cloned at all (a function)
-    // all surface as the same end-node result error.
-    cloned = structuredClone(node.result ?? null);
-  } catch {
-    throw new Error(END_RESULT_UNCLONEABLE_MESSAGE(node.id));
-  }
-  if (containsSharedMemory(cloned)) {
-    throw new Error(END_RESULT_SHARED_MEMORY_MESSAGE(node.id));
-  }
-  return cloned;
+  return readConfiguredCopy(node, 'result', END_RESULT_COPY_ERRORS, null);
 }
 
 // Resolves the outgoing edges of a node. Trigger, form and action nodes may
@@ -1543,24 +1517,29 @@ function advanceSchedule(state) {
 // or null when execution should continue.
 function applyRegularNode(node, state) {
   if (node.type === 'action') {
-    // Snapshot the legacy message at this action's own execution moment: the
-    // saved output is this run's independent deep copy, so editing nested
-    // fields, adding or deleting properties, or changing array members of the
-    // returned output never reaches the definition, another run, or an output
-    // this action recorded while another activated branch is still waiting.
+    // Snapshot the legacy message at this action's own execution moment via
+    // the shared configured-value rule (readConfiguredCopy): the saved output
+    // is this run's independent deep copy, so editing nested fields, adding or
+    // deleting properties, or changing array members of the returned output
+    // never reaches the definition, another run, or an output this action
+    // recorded while another activated branch is still waiting.
     // Validation only proved the message was safe as it was then — an
     // enumerable getter may answer differently on this, its only
     // execution-time read, and a preceding business operation may have
-    // replaced ordinary buffers with shared ones (or vice versa) — so
-    // captureActionMessage re-checks the value actually read now and throws
-    // the action-node error (uncloneable, or retained shared memory) when
-    // this run's copy cannot be independent. That throw is not a run status:
-    // the synchronous entry propagates it and the asynchronous entry's
-    // Promise rejects with it — never an action_failed, no retry budget is
-    // spent, no compensation runs, no output is recorded for this node and no
-    // later node executes. An unset, undefined or null message defaults to
-    // action:<node id>; "", 0 and false pass through untouched.
-    setNodeOutput(state.context.output, node.id, captureActionMessage(node));
+    // replaced ordinary buffers with shared ones (or vice versa) — so the
+    // rule re-checks the value actually read now and throws the action-node
+    // error (uncloneable, or retained shared memory) when this run's copy
+    // cannot be independent. That throw is not a run status: the synchronous
+    // entry propagates it and the asynchronous entry's Promise rejects with
+    // it — never an action_failed, no retry budget is spent, no compensation
+    // runs, no output is recorded for this node and no later node executes.
+    // An unset, undefined or null message defaults to action:<node id>; "", 0
+    // and false pass through untouched.
+    setNodeOutput(
+      state.context.output,
+      node.id,
+      readConfiguredCopy(node, 'message', ACTION_MESSAGE_COPY_ERRORS, `action:${node.id}`),
+    );
   }
   if (node.type === 'form') {
     const compiled = formSchemas.get(node);
