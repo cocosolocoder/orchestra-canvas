@@ -441,11 +441,15 @@ const END_RESULT_COPY_ERRORS = {
     `end node ${nodeId}: result contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this end result is not supported`,
 };
 
-// The single independent-copy rule for a value a node configures — a legacy
-// action's `message` and an end node's `result` both go through here, so the
-// cloneability and retained-shared-memory rules are maintained in exactly one
-// place and the two node kinds can never drift apart. It is invoked at two
-// moments, and each moment keeps its original root-read protocol:
+// The configured-value application of the shared independent-copy rule
+// (copyIndependently): a legacy action's `message` and an end node's `result`
+// both go through here, so the two node kinds can never drift apart. Each
+// kind keeps its own wording — the `errors` map carries the node-specific
+// text the entries already exposed, keyed by the same kinds copyIndependently
+// reports — and its own default for a value that is absent, undefined or
+// null (action:<node id> for a legacy message; null for an end result),
+// while "", 0 and false pass through untouched for both. The rule is invoked
+// at two moments, and each moment keeps its original root-read protocol:
 //
 //  1. At validation time (assertConfiguredCopy), for every such node in the
 //     definition — including nodes on untaken branches and nodes the entry
@@ -461,24 +465,9 @@ const END_RESULT_COPY_ERRORS = {
 //     — an enumerable getter's later answer and a preceding business
 //     operation's or another activated branch's mutation are both captured.
 //
-// At either moment every nested enumerable accessor is read only by
-// structuredClone's own read — there is no separate inspection pass over the
-// original, so a getter's return order is never disturbed and the value the
-// clone's read produced is both what is judged and what is saved (a legal
-// value whose getter answers with a different ordinary value at execution
-// time records that fresh value rather than the stale validation-time one). A
-// root getter that throws on execution's single read, a nested getter that
+// A root getter that throws on execution's single read, a nested getter that
 // throws while the clone reads it, and a value that cannot be cloned at all
 // (a bare function) all surface as the same uncloneable error.
-//
-// The clone is produced first and judged with containsSharedMemory: only
-// shared memory the clone actually retains condemns the value (an attached
-// property of a Date/RegExp, a non-enumerable or symbol-keyed property, an
-// Error own property other than cause are discarded by the clone and never
-// inspected); a custom Map/Set Symbol.iterator can neither hide the
-// container's real members nor fabricate shared ones. Uncloneability takes
-// precedence over shared memory: the clone attempt short-circuits before the
-// shared-memory traversal.
 //
 // Any failure is thrown as an ordinary Error naming the node (errors[kind])
 // rather than recorded as a run status: the synchronous entry propagates it
@@ -495,22 +484,15 @@ function configuredCopy(node, property, errors, options) {
     // Preserve the validation gate exactly: no read at all for a missing own
     // property, one unguarded gate read (a throwing root accessor propagates
     // raw, as the former per-node gates did), and an undefined value is left
-    // to execution. The structuredClone argument evaluation is the root's
-    // second — and final — read this moment; the clone itself traverses that
-    // captured value (firing nested getters once), so no read the original
-    // gate made is added or removed.
+    // to execution. The copyIndependently argument evaluation is the root's
+    // second — and final — read this moment; the clone inside it traverses
+    // that captured value (firing nested getters once), so no read the
+    // original gate made is added or removed.
     if (!Object.hasOwn(node, property)) return;
     const gated = node[property];
     if (gated === undefined) return;
-    let cloned;
-    try {
-      cloned = structuredClone(node[property]);
-    } catch {
-      throw new Error(errors.uncloneable(node.id));
-    }
-    if (containsSharedMemory(cloned)) {
-      throw new Error(errors.sharedMemory(node.id));
-    }
+    const copy = copyIndependently(node[property]);
+    if (!copy.ok) throw new Error(errors[copy.kind](node.id));
     return;
   }
 
@@ -527,19 +509,11 @@ function configuredCopy(node, property, errors, options) {
   }
   if (value === undefined || value === null) return absentValue;
 
-  let cloned;
-  try {
-    // Clone the value the single read captured — the root is not read again —
-    // so every nested enumerable accessor is read only by the clone's own
-    // read and this, the execution-moment value, is both judged and saved.
-    cloned = structuredClone(value);
-  } catch {
-    throw new Error(errors.uncloneable(node.id));
-  }
-  if (containsSharedMemory(cloned)) {
-    throw new Error(errors.sharedMemory(node.id));
-  }
-  return cloned;
+  // Judge and save the value the single read captured — the root is not read
+  // again — so this, the execution-moment value, is both judged and saved.
+  const copy = copyIndependently(value);
+  if (!copy.ok) throw new Error(errors[copy.kind](node.id));
+  return copy.value;
 }
 
 // Validation gate: reject a statically uncopyable configured value. Nothing
@@ -1217,59 +1191,104 @@ function containsSharedMemory(value) {
   return false;
 }
 
-// Receives the caller's run input: structured-clone it once and judge that
-// clone, exactly as runWithRetries does for operation return values. The run
-// input is promised to every node — and to every business attempt and
-// compensation snapshot — as an independent copy, and a SharedArrayBuffer
-// cannot satisfy that promise: cloning it (or a typed array / DataView backed
-// by one) "succeeds" while the clone keeps sharing the underlying bytes with
-// the object the caller holds, so a business action that rewrites its input
-// copy could mutate the caller's data, and a failed attempt's rewrite would
-// leak into the next attempt and later retries. An input whose clone actually
-// retains shared memory is therefore rejected before any node can run — a
-// TypeError (the synchronous entry throws it; the asynchronous entry rejects
-// with the same error) explaining that the run input contains shared memory
-// and independent copies cannot be guaranteed. The judgment runs on the
-// clone, so the same rules as return values hold: an enumerable getter is read
-// exactly once (by the clone's own read), a custom Map/Set iterator cannot
-// hide real members or fabricate shared ones, and shared memory placed only
-// where cloning drops it (Date/RegExp attached properties, non-enumerable or
-// symbol-keyed properties, Error own properties other than cause) never
-// condemns otherwise-legal data.
+// The single independent-copy rule every value the engine saves goes through,
+// regardless of its source — a node's configured value (a legacy action's
+// message, an end node's result), a business action's or compensation's
+// return value, and the run input itself. It exists so the rule is maintained
+// in exactly one place and the sources can never drift apart:
+//
+//  1. Clone first with structuredClone, then judge the CLONE with
+//     containsSharedMemory — never the original value. The judged object is
+//     exactly the content that will be saved, so:
+//     - every nested enumerable accessor is read only by the clone's own
+//       read; there is no separate inspection pass over the original, a
+//       getter's return order is never disturbed, and a getter that answers
+//       with ordinary content first and shared memory later is judged — and
+//       saved — on the ordinary content the clone captured;
+//     - a Map/Set with a custom Symbol.iterator (empty, throwing, or
+//       fabricating entries) can neither hide the container's real members
+//       nor invent shared ones, because the clone already captured the true
+//       internal entries;
+//     - shared memory placed only where cloning drops it (own properties of
+//       Date/RegExp/byte views, non-enumerable or symbol-keyed properties,
+//       Error own properties other than "cause") never condemns the value;
+//     - a plain ArrayBuffer and its views keep their type and bytes, and
+//       circular or repeated references in a legal graph survive untouched.
+//  2. Uncloneability takes precedence over retained shared memory: the clone
+//     attempt short-circuits before the shared-memory traversal, so a value
+//     carrying both is reported as uncloneable.
+//
+// The result is a plain discriminated record whose `kind` strings match the
+// keys of each source's own error/message map, so every caller turns a
+// failure into its own public shape — a thrown node-named Error for
+// configured values, a recorded attempt failure for operation returns, a
+// TypeError for the run input — while the copy-and-judge rule itself is
+// shared. `cause` keeps the clone's original error for sources that
+// propagate it (the run input); the rest discard it.
+function copyIndependently(value) {
+  let cloned;
+  try {
+    cloned = structuredClone(value);
+  } catch (cause) {
+    return { ok: false, kind: 'uncloneable', cause };
+  }
+  if (containsSharedMemory(cloned)) {
+    return { ok: false, kind: 'sharedMemory' };
+  }
+  return { ok: true, value: cloned };
+}
+
+// Receives the caller's run input: put it through the same shared
+// independent-copy rule (copyIndependently) that operation return values and
+// node-configured values use. The run input is promised to every node — and
+// to every business attempt and compensation snapshot — as an independent
+// copy, and a SharedArrayBuffer cannot satisfy that promise: cloning it (or
+// a typed array / DataView backed by one) "succeeds" while the clone keeps
+// sharing the underlying bytes with the object the caller holds, so a
+// business action that rewrites its input copy could mutate the caller's
+// data, and a failed attempt's rewrite would leak into the next attempt and
+// later retries. An input whose clone actually retains shared memory is
+// therefore rejected before any node can run — a TypeError (the synchronous
+// entry throws it; the asynchronous entry rejects with the same error)
+// explaining that the run input contains shared memory and independent
+// copies cannot be guaranteed. An input that cannot be cloned at all keeps
+// structuredClone's own error, exactly as before. Because the judgment runs
+// on the clone, the shared rule's guarantees hold here too: an enumerable
+// getter is read exactly once (by the clone's own read), a custom Map/Set
+// iterator cannot hide real members or fabricate shared ones, and shared
+// memory placed only where cloning drops it (Date/RegExp attached
+// properties, non-enumerable or symbol-keyed properties, Error own
+// properties other than cause) never condemns otherwise-legal data.
 const RUN_INPUT_SHARED_MEMORY_MESSAGE = 'run input contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this run cannot be started';
 
 function cloneRunInput(input) {
-  const cloned = structuredClone(input);
-  if (containsSharedMemory(cloned)) {
+  const copy = copyIndependently(input);
+  if (!copy.ok) {
+    if (copy.kind === 'uncloneable') throw copy.cause;
     throw new TypeError(RUN_INPUT_SHARED_MEMORY_MESSAGE);
   }
-  return cloned;
+  return copy.value;
 }
 
 // Runs an operation under a retry policy — the one attempt loop shared by
 // business actions and compensations. Every invocation works on fresh
 // structured-clone argument copies produced by prepareArgs, so mutations by
 // a failed attempt are discarded before the next try; a thrown exception, a
-// rejected Promise, a return value carrying shared memory (a
-// SharedArrayBuffer or a byte view over one, anywhere in the saved graph),
-// or a return value that cannot be structured-cloned all count as a failed
-// attempt. Shared memory is rejected explicitly: cloning it "succeeds" but
-// keeps sharing the underlying bytes with an object the implementation can
-// still mutate, so no independent saved copy is possible. On success the
-// recorded value is a clone independent of any object the implementation
-// keeps holding. Attempts are numbered from 1, the wait after a failure
-// follows the configured backoff (zero stays zero, nothing is awaited after
-// the last attempt), and each actual invocation appends exactly one record,
-// in order, via collect.
+// rejected Promise, or a return value that cannot become an independent copy
+// (the shared copyIndependently rule: uncloneable, or retaining shared
+// memory) all count as a failed attempt. On success the recorded value is a
+// clone independent of any object the implementation keeps holding. Attempts
+// are numbered from 1, the wait after a failure follows the configured
+// backoff (zero stays zero, nothing is awaited after the last attempt), and
+// each actual invocation appends exactly one record, in order, via collect.
 //
 // The two callers differ only through the hooks:
 // - prepareArgs(attempt) builds this attempt's fresh argument copies;
 // - invoke is the registered implementation, called as invoke(...args);
 // - createRecord(attempt) shapes the record (business attempts carry no
 //   operation/result fields, compensation attempts do);
-// - cloneFailureMessage names the operation kind for uncloneable returns;
-// - sharedMemoryFailureMessage names it for returns that contain shared
-//   memory, which cannot be isolated even though they clone;
+// - copyFailureMessages maps each copyIndependently failure kind to the
+//   operation-kind-specific text recorded for it;
 // - collect appends to the caller's own attempt list;
 // - onSuccess stores caller-specific success data on the record.
 // When a cancellation signal is given, no new attempt starts once it has
@@ -1278,7 +1297,7 @@ function cloneRunInput(input) {
 // Compensation passes no signal and is therefore never interrupted.
 async function runWithRetries({
   retry, signal = null, prepareArgs, invoke, createRecord,
-  cloneFailureMessage, sharedMemoryFailureMessage, collect, onSuccess,
+  copyFailureMessages, collect, onSuccess,
 }) {
   let lastReason = null;
 
@@ -1296,27 +1315,20 @@ async function runWithRetries({
       record.error = lastReason;
     }
 
-    // Clone first, then judge the clone: the isolation check must reflect
-    // exactly the content that will be saved. Inspecting the original return
-    // value would read enumerable getters an extra time (a getter that
-    // changes its answer between reads could swap ordinary saved content for
-    // later-appearing shared memory, or vice versa) and would iterate Map/Set
-    // through a possibly-overridden Symbol.iterator, while structuredClone
-    // reads the real internal entries. A return value whose normal reads
-    // throw, or that cannot be cloned at all, is the ordinary uncloneable
-    // failure — never an exception escaping the run.
+    // Judge exactly the content that will be saved: copyIndependently clones
+    // the return value first and checks the clone, so the original's
+    // enumerable getters are read only by the clone's own read and a custom
+    // Map/Set iterator cannot stand in for the real members. A return value
+    // whose normal reads throw, or that cannot be cloned at all, is the
+    // ordinary uncloneable failure — never an exception escaping the run.
     if (record.error === null) {
-      try {
-        returned = structuredClone(returned);
-      } catch (error) {
-        lastReason = cloneFailureMessage;
+      const copy = copyIndependently(returned);
+      if (copy.ok) {
+        returned = copy.value;
+      } else {
+        lastReason = copyFailureMessages[copy.kind];
         record.error = lastReason;
       }
-    }
-
-    if (record.error === null && containsSharedMemory(returned)) {
-      lastReason = sharedMemoryFailureMessage;
-      record.error = lastReason;
     }
 
     if (record.error === null) {
@@ -1362,8 +1374,10 @@ async function runBusinessAction(node, binding, implementation, context, actionA
     prepareArgs: attempt => [structuredClone(context.input), structuredClone(context.output), node.id, attempt],
     invoke: implementation,
     createRecord: attempt => ({ nodeId: node.id, attempt, ok: false, error: null, nextDelayMs: 0 }),
-    cloneFailureMessage: `operation "${binding.name}" returned a value that cannot be structured-cloned`,
-    sharedMemoryFailureMessage: `operation "${binding.name}" returned a value that contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this return value is not supported`,
+    copyFailureMessages: {
+      uncloneable: `operation "${binding.name}" returned a value that cannot be structured-cloned`,
+      sharedMemory: `operation "${binding.name}" returned a value that contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this return value is not supported`,
+    },
     collect: record => actionAttempts.push(record),
     onSuccess: () => {},
   });
@@ -1387,8 +1401,10 @@ async function runCompensation(entry, implementation, records) {
       nodeId, operation: binding.compensation.name, attempt,
       ok: false, error: null, nextDelayMs: 0, result: null,
     }),
-    cloneFailureMessage: `compensation "${binding.compensation.name}" returned a value that cannot be structured-cloned`,
-    sharedMemoryFailureMessage: `compensation "${binding.compensation.name}" returned a value that contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this return value is not supported`,
+    copyFailureMessages: {
+      uncloneable: `compensation "${binding.compensation.name}" returned a value that cannot be structured-cloned`,
+      sharedMemory: `compensation "${binding.compensation.name}" returned a value that contains shared memory (SharedArrayBuffer or a typed array/DataView backed by one); independent copies cannot be guaranteed, so this return value is not supported`,
+    },
     collect: record => records.push(record),
     onSuccess: (record, returned) => { record.result = returned; },
   });
