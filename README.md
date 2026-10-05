@@ -474,6 +474,233 @@ The result carries the `context`, `trace`, `actionAttempts`, `compensationStatus
 - **Compensation after cancellation** follows the usual rules: successful actions that declared a compensation are undone in reverse success order with their success-moment snapshots and compensation retry configs, a failed compensation never stops earlier ones, and the result returns only after all of them finish. Further cancellation during compensation neither interrupts it nor causes duplicate calls, and successful outputs are never deleted. With nothing to compensate, `compensationStatus` is `not_needed`.
 - A run that already visited `end` but still has unfinished activated branches can still be cancelled. A cancellation that arrives only after the terminal state was determined — including while a failure's compensation is still running — never rewrites that result.
 
+### End-to-end example: cancel while a compensable business action is still running
+
+Cancellation is **cooperative, not an interrupt**. The snippet below makes a business action that declares a compensation start and stay pending; the caller cancels at that exact point; the action then finishes successfully with a structured result. The engine does not kill the call — it waits for it to finish, saves the success, skips every not-yet-run node, runs the declared compensation, and returns only after all of that. The whole example is self-contained and uses locally simulated timing (no external services); it is also saved as `examples/cancel-in-flight.mjs`.
+
+The workflow is a straight line: `start` (trigger) → `prepare` (legacy message action) → `reserve` (business operation `reserveStock`, declaring compensation `releaseStock`) → `notify` (legacy message action) → `done` (end). The complete script is at `examples/cancel-in-flight.mjs`; the code is reproduced below (minus that file's leading comment banner), and the relative import reflects its location:
+
+```js
+import { executeWorkflowAsync } from '../src/engine.js';
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+const startedAt = Date.now();
+const log = event => console.log(
+  `${String(Date.now() - startedAt).padStart(3)} ms  ${event}`,
+);
+
+// start -> prepare (message) -> reserve (business, compensable)
+//        -> notify (message) -> done (end)
+const workflow = {
+  id: 'cancellable-order',
+  entry: 'start',
+  nodes: [
+    { id: 'start', type: 'trigger', next: 'prepare' },
+    { id: 'prepare', type: 'action', message: 'stock request logged', next: 'reserve' },
+    {
+      id: 'reserve',
+      type: 'action',
+      operation: 'reserveStock',
+      compensation: { operation: 'releaseStock' },
+      next: 'notify',
+    },
+    { id: 'notify', type: 'action', message: 'reservation confirmed', next: 'done' },
+    { id: 'done', type: 'end', result: 'order-finished' },
+  ],
+};
+
+const input = { orderId: 'ord-77', sku: 'WIDGET-2', quantity: 3 };
+
+const controller = new AbortController();
+controller.signal.addEventListener('abort', () => {
+  log('cancel request arrived (AbortController.abort() fired)');
+});
+
+// Captured from inside the compensation so we can inspect its arguments after
+// the run. The run itself never exposes these snapshots anywhere else.
+let compensationReceived = null;
+
+const operations = {
+  // A locally simulated slow business action: it is still pending when the
+  // caller cancels, then finishes successfully with a structured result.
+  async reserveStock(runInput, _output, nodeId, attempt) {
+    log(`business action "${nodeId}" started (attempt ${attempt})`);
+    setTimeout(() => controller.abort(), 15); // cancel while still in flight
+    await sleep(60);
+    const value = {
+      reserved: true,
+      reservationId: 'res-1001',
+      orderId: runInput.orderId,
+      items: [{ sku: runInput.sku, quantity: runInput.quantity }],
+    };
+    log(`business action "${nodeId}" returned a successful result`);
+    return value;
+  },
+
+  // The compensation declared by "reserve". Called only after the run has
+  // stopped scheduling normal nodes, and awaited before the run returns.
+  async releaseStock(input, earlierOutput, result, nodeId, attempt) {
+    log(`compensation for "${nodeId}" (operation "releaseStock") started, attempt ${attempt}`);
+    compensationReceived = {
+      input: structuredClone(input),
+      earlierOutput: structuredClone(earlierOutput),
+      result: structuredClone(result),
+      nodeId,
+      attempt,
+    };
+    // Every argument is an independent copy: these writes cannot reach the
+    // run's saved output, the input, or any later invocation.
+    input.tamperedByCompensation = true;
+    result.reserved = false;
+    await sleep(10);
+    log('compensation "releaseStock" finished');
+    return { released: true, reservationId: result.reservationId };
+  },
+};
+
+const run = executeWorkflowAsync(workflow, input, operations, {
+  signal: controller.signal,
+});
+const execution = await run;
+log('workflow returned to the caller');
+
+console.log('\n--- arguments the compensation received ---');
+console.log(JSON.stringify(compensationReceived, null, 2));
+
+console.log('\n--- workflow result ---');
+console.log(JSON.stringify(execution, null, 2));
+console.log(`top-level "result" field present: ${'result' in execution}`);
+console.log(`"notify" ran (present in output): ${Object.hasOwn(execution.context.output, 'notify')}`);
+```
+
+Run it from the project root:
+
+```bash
+node examples/cancel-in-flight.mjs
+```
+
+The event log shows the ordering that matters (the millisecond numbers come from one real machine and will vary; the sequence is deterministic):
+
+```text
+  2 ms  business action "reserve" started (attempt 1)
+ 18 ms  cancel request arrived (AbortController.abort() fired)
+ 62 ms  business action "reserve" returned a successful result
+ 63 ms  compensation for "reserve" (operation "releaseStock") started, attempt 1
+ 73 ms  compensation "releaseStock" finished
+ 74 ms  workflow returned to the caller
+```
+
+The cancellation lands at 18 ms while `reserve` is still awaiting — but nothing returns at that moment. The business action runs to its successful return at 62 ms; only then does the engine record the success, stop scheduling further normal nodes, and start the compensation. The run resolves to the caller at 74 ms, after the compensation finishes. The caller cannot get a `cancelled` answer "instantly" while an action or a compensation is still running.
+
+This is the returned result of that run:
+
+```json
+{
+  "status": "cancelled",
+  "context": {
+    "input": { "orderId": "ord-77", "sku": "WIDGET-2", "quantity": 3 },
+    "output": {
+      "prepare": "stock request logged",
+      "reserve": {
+        "reserved": true,
+        "reservationId": "res-1001",
+        "orderId": "ord-77",
+        "items": [{ "sku": "WIDGET-2", "quantity": 3 }]
+      }
+    }
+  },
+  "trace": [
+    { "nodeId": "start", "type": "trigger" },
+    { "nodeId": "prepare", "type": "action" },
+    { "nodeId": "reserve", "type": "action" }
+  ],
+  "actionAttempts": [
+    { "nodeId": "reserve", "attempt": 1, "ok": true, "error": null, "nextDelayMs": 0 }
+  ],
+  "compensationStatus": "completed",
+  "compensationAttempts": [
+    {
+      "nodeId": "reserve",
+      "operation": "releaseStock",
+      "attempt": 1,
+      "ok": true,
+      "error": null,
+      "nextDelayMs": 0,
+      "result": { "released": true, "reservationId": "res-1001" }
+    }
+  ]
+}
+```
+
+Reading the fields:
+
+- **`status: "cancelled"`** and there is **no top-level `result`** (`'result' in execution` is `false`). A cancelled run never reports the end node's result, even though the in-flight action succeeded.
+- **`context.output` keeps the successful business action's return value.** `reserve` holds the structured result exactly as returned (independently cloned), and the earlier `prepare` message is preserved too. Compensation undoes the *effect*; it does not delete the saved output. The writes the compensation makes to its own copies (`tamperedByCompensation`, `reserved = false`) never appear here.
+- **`actionAttempts` records the call as a success**: `{ nodeId: "reserve", attempt: 1, ok: true, error: null, nextDelayMs: 0 }`. The action that was in flight when cancellation arrived is not marked failed or retried.
+- **`trace` contains only nodes that actually executed**: `start`, `prepare`, `reserve`. The successor `notify` and the end node `done` never ran — neither appears in the trace, and there is no `notify` key in `context.output`.
+- **`compensationStatus: "completed"`** because the one compensable success was undone successfully. The record in `compensationAttempts` carries `nodeId: "reserve"` — the **original business node**, not a new node id — together with the compensation's own operation name (`releaseStock`) and its cloned return value. Compensation calls never appear in the regular `trace`.
+
+The compensation's five arguments, captured during the run, are:
+
+```json
+{
+  "input": { "orderId": "ord-77", "sku": "WIDGET-2", "quantity": 3 },
+  "earlierOutput": { "prepare": "stock request logged" },
+  "result": {
+    "reserved": true,
+    "reservationId": "res-1001",
+    "orderId": "ord-77",
+    "items": [{ "sku": "WIDGET-2", "quantity": 3 }]
+  },
+  "nodeId": "reserve",
+  "attempt": 1
+}
+```
+
+- `input` is an independent copy of the run input as it was **when the original action succeeded** (forms before that action would have already applied their defaults; forms after it would not be visible).
+- `earlierOutput` is an independent copy of every earlier successful node output as of that moment — the action's **own** output key is deliberately excluded, so only `prepare` is present.
+- `result` is an independent copy of the value `reserveStock` returned.
+- `nodeId` points back at the original action node (`reserve`), and compensation `attempt` starts at `1` for each node.
+
+### Boundary: the awaited action fails after cancellation
+
+If the action that is still in flight when cancellation arrives ultimately **throws** (or returns an uncloneable/shared-memory value), the run still ends `cancelled` — the late failure is neither promoted to `action_failed` nor retried. Keeping the workflow and cancellation call above but giving `reserve` three allowed attempts and replacing its implementation with one that fails after the abort:
+
+```js
+// On the "reserve" node:
+//   retry: { attempts: 3, initialDelayMs: 0, backoffFactor: 1, maxDelayMs: 0 }
+reserveStock: async () => {
+  setTimeout(() => controller.abort(), 10);
+  await sleep(40);
+  throw new Error('warehouse rejected the reservation');
+},
+```
+
+The single failed attempt is kept and the run closes immediately:
+
+```json
+{
+  "status": "cancelled",
+  "context": {
+    "input": { "orderId": "ord-77", "sku": "WIDGET-2", "quantity": 3 },
+    "output": { "prepare": "stock request logged" }
+  },
+  "trace": [
+    { "nodeId": "start", "type": "trigger" },
+    { "nodeId": "prepare", "type": "action" },
+    { "nodeId": "reserve", "type": "action" }
+  ],
+  "actionAttempts": [
+    { "nodeId": "reserve", "attempt": 1, "ok": false, "error": "warehouse rejected the reservation", "nextDelayMs": 0 }
+  ],
+  "compensationStatus": "not_needed",
+  "compensationAttempts": []
+}
+```
+
+Despite `attempts: 3`, the operation is invoked exactly once: no retry starts after cancellation (`nextDelayMs` is `0` and no wait runs). No output is saved for `reserve` — its key never appears (the earlier `prepare` output is simply preserved as-is), and `notify` and `done` never run. Because the action never succeeded, `releaseStock` is never invoked — there is nothing to compensate, hence `compensationStatus: "not_needed"` and an empty `compensationAttempts`. A failure in this position changes only the attempt record; the terminal status remains the cancellation's.
+
 The synchronous `executeWorkflow`, the command-line demo and uncancelled runs behave exactly as before.
 
 
