@@ -223,6 +223,17 @@ function compileCondition(condition, nodes, nodeId, position = '$', depth = 1) {
     if (condition[key].length === 0) {
       throw new Error(`condition node ${nodeId} at ${position}: ${key} must not be empty`);
     }
+    // A sparse array — length with no element at some index, e.g. after
+    // `delete conditions[1]` — must not pass validation: the map below would
+    // skip the hole and leave a missing child that only blows up at run time
+    // (or hides behind short-circuiting). Reject every hole at its exact
+    // position; an explicitly present undefined/null still falls through to
+    // the ordinary "condition must be an object" error.
+    for (let index = 0; index < condition[key].length; index += 1) {
+      if (!Object.hasOwn(condition[key], index)) {
+        throw new Error(`condition node ${nodeId} at ${position}.${key}[${index}]: sub-condition is missing; ${key} must not contain holes`);
+      }
+    }
     return {
       kind: key,
       children: condition[key].map((child, index) =>

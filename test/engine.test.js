@@ -420,6 +420,87 @@ test('rejects malformed condition definitions before execution, including untake
   assert.throws(() => executeWorkflow(branched, { route: 'b' }), /unknown condition operator/);
 });
 
+test('rejects holes in all/any child arrays at validation, naming the exact position', () => {
+  const valid = { field: 'a', operator: 'gte', value: 1 };
+
+  // A hole in the middle, at the end, and an array with only a length.
+  assert.throws(() => validateWorkflow(conditionWorkflow({ any: [valid, , valid] })),
+    /condition node check at \$\.any\[1\]: sub-condition is missing/);
+  assert.throws(() => validateWorkflow(conditionWorkflow({ all: [valid, ,] })),
+    /condition node check at \$\.all\[1\]: sub-condition is missing/);
+  assert.throws(() => validateWorkflow(conditionWorkflow({ all: new Array(2) })),
+    /condition node check at \$\.all\[0\]: sub-condition is missing/);
+
+  // Nested holes keep the full path from the root condition, with indexes
+  // matching the original arrays.
+  assert.throws(() => validateWorkflow(conditionWorkflow({ all: [valid, { any: [valid, ,] }] })),
+    /condition node check at \$\.all\[1\]\.any\[1\]: sub-condition is missing/);
+  assert.throws(() => validateWorkflow(conditionWorkflow({ not: { any: [valid, , valid] } })),
+    /condition node check at \$\.not\.any\[1\]: sub-condition is missing/);
+
+  // An explicitly present undefined or null is not a hole: it stays an
+  // ordinary invalid sub-condition error at its position.
+  assert.throws(() => validateWorkflow(conditionWorkflow({ any: [valid, undefined] })),
+    /\$\.any\[1\]: condition must be an object/);
+  assert.throws(() => validateWorkflow(conditionWorkflow({ all: [null] })),
+    /\$\.all\[0\]: condition must be an object/);
+
+  // Validation is independent of the branch a run would take: even when the
+  // child before the hole already decides the result, the definition is
+  // rejected before anything executes.
+  assert.throws(() => executeWorkflow(conditionWorkflow({ all: [{ field: 'a', operator: 'eq', value: 0 }, ,] }), { a: 1 }),
+    /\$\.all\[1\]: sub-condition is missing/);
+  assert.throws(() => executeWorkflow(conditionWorkflow({ any: [{ field: 'a', operator: 'eq', value: 1 }, ,] }), { a: 1 }),
+    /\$\.any\[1\]: sub-condition is missing/);
+
+  // The caller's condition array and workflow definition are left untouched.
+  const children = [valid, , valid];
+  const definition = conditionWorkflow({ any: children });
+  assert.throws(() => validateWorkflow(definition), /sub-condition is missing/);
+  assert.equal(children.length, 3);
+  assert.equal(1 in children, false);
+  assert.equal(definition.nodes[1].condition.any, children);
+});
+
+test('a hole on an untaken or unreachable branch is rejected before any business action runs', async () => {
+  // The condition with the hole sits on the branch the run never takes.
+  const branched = {
+    id: 'untaken-hole', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'check' },
+      { id: 'check', type: 'condition', condition: { field: 'route', operator: 'eq', value: 'a' }, then: 'a', else: 'b' },
+      { id: 'a', type: 'condition', condition: { any: [{ field: 'x', operator: 'exists' }, ,] }, then: 'end', else: 'end' },
+      { id: 'b', type: 'end', result: 'b' },
+      { id: 'end', type: 'end', result: 'end' },
+    ],
+  };
+  assert.throws(() => executeWorkflow(branched, { route: 'b' }),
+    /condition node a at \$\.any\[1\]: sub-condition is missing/);
+
+  // A business action in front of the broken condition must not run, and no
+  // compensation may be triggered: the async entry rejects before executing.
+  let invoked = 0;
+  let compensated = 0;
+  const withAction = {
+    id: 'action-first', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'work' },
+      {
+        id: 'work', type: 'action', operation: 'work', next: 'check',
+        compensation: { operation: 'undo' },
+      },
+      { id: 'check', type: 'condition', condition: { all: [{ field: 'a', operator: 'exists' }, ,] }, then: 'end', else: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  await assert.rejects(
+    executeWorkflowAsync(withAction, { a: 1 }, {
+      work: () => { invoked += 1; return 'ok'; },
+      undo: () => { compensated += 1; },
+    }),
+    /condition node check at \$\.all\[1\]: sub-condition is missing/);
+  assert.equal(invoked, 0);
+  assert.equal(compensated, 0);
+});
+
 test('nests up to 32 levels and rejects the 33rd, reporting the position', () => {
   const nested = depth => {
     let condition = { field: 'x', operator: 'exists' };

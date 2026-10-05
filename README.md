@@ -57,7 +57,7 @@ Every condition is one of the following, and conditions may be nested freely (up
 - Disjunction — `{ "any": [condition, ...] }`, true when at least one child is true.
 - Negation — `{ "not": condition }`, the inverted result of its single child.
 
-`all` and `any` must be non-empty arrays. A node uses exactly one of `all`, `any`, `not`, and a compound cannot also carry comparison keys. Children are evaluated in declaration order with short-circuiting: `all` stops at the first `false`, `any` at the first `true`, so skipped children are never read and cannot raise errors.
+`all` and `any` must be non-empty arrays. Every position in them must hold an actual sub-condition: a sparse array — length with no element at some index, as `delete` leaves behind — is rejected by definition validation with an error naming the condition node and the exact child position (e.g. `$.any[1]`, keeping the full nesting path from the root condition), no matter which branch a run would take or whether short-circuiting would have skipped the hole. An explicitly present `undefined`/`null` entry is reported as an ordinary invalid sub-condition instead. A node uses exactly one of `all`, `any`, `not`, and a compound cannot also carry comparison keys. Children are evaluated in declaration order with short-circuiting: `all` stops at the first `false`, `any` at the first `true`, so skipped children are never read and cannot raise errors.
 
 Comparison operators:
 
