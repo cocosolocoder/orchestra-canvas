@@ -363,6 +363,59 @@ function compileRetry(config, label) {
   };
 }
 
+// The independent-copy rule for a configured value the engine itself saves as
+// node output: a legacy message action's `message` and an end node's
+// `result`. Both promise that the saved value is an independent structured
+// clone of what the node actually executes with, and both enforce the promise
+// at two moments — at definition time (compileAction / compileEndResult, for
+// every such node, including nodes on untaken branches and nodes the entry
+// cannot reach) and at the node's own execution moment (captureActionMessage /
+// captureEndResult, against the value this run is actually about to save).
+// This is the one implementation both kinds use at both moments: tuning the
+// rule here can never let message actions and end nodes drift apart.
+//
+// The value is structured-cloned first and only the resulting clone is
+// judged, which is what makes every guarantee hold identically at every call:
+//
+//   - the original is read only by structuredClone's own single read. There is
+//     no separate inspection pass, so an enumerable getter's return order is
+//     never disturbed and the clone is both what is judged and what is saved
+//     (a getter that answers with a different ordinary value at execution
+//     time saves that fresh value, never the validation-time one);
+//   - a value that cannot be cloned (a bare function, a function nested in an
+//     object/array, an accessor that throws, a revoked proxy, etc.) fails with
+//     the caller's cloneability error;
+//   - a value that clones but whose clone retains shared memory — cloning a
+//     SharedArrayBuffer (or a typed array / DataView backed by one)
+//     "succeeds" while the clone keeps sharing the underlying bytes — fails
+//     with the caller's shared-memory error. containsSharedMemory runs on the
+//     clone, so only the shared memory the clone actually retains condemns the
+//     value: shared memory placed where the clone drops it (an attached
+//     property of a Date/RegExp, a non-enumerable or symbol-keyed property, an
+//     Error own property other than cause) is discarded with that property and
+//     never inspected, and a custom Map/Set iterator cannot hide the
+//     container's real members or fabricate shared ones;
+//   - uncloneability takes precedence when a value carries both: the clone is
+//     attempted first and its failure short-circuits before the
+//     shared-memory traversal.
+//
+// The caller has already performed the value's single root read (and applied
+// any node-specific default) and supplies the node id plus the two
+// node-specific messages, so each node keeps its own wording while the rule
+// itself lives in exactly one place.
+function cloneConfiguredValue(value, { nodeId, cloneFailureMessage, sharedMemoryFailureMessage }) {
+  let cloned;
+  try {
+    cloned = structuredClone(value);
+  } catch {
+    throw new Error(cloneFailureMessage(nodeId));
+  }
+  if (containsSharedMemory(cloned)) {
+    throw new Error(sharedMemoryFailureMessage(nodeId));
+  }
+  return cloned;
+}
+
 // An action node either keeps the legacy `message` behavior, names a business
 // operation the caller supplies at run time, and/or declares a compensation
 // operation that undoes its business effect. Both retry blocks are optional
@@ -404,39 +457,25 @@ function compileAction(node) {
   }
 
   // A legacy message action (no operation) may carry a structured object or
-  // array as its message, and the output it saves is snapshotted per run. A
-  // value the structured clone algorithm cannot deliver — a bare function or
-  // a function nested inside an object/array — is a definition error naming
-  // the action and the reason, for every message action including actions on
-  // untaken branches and entry-unreachable ones. An action that names an
-  // operation ignores its message entirely, so an unused uncloneable message
-  // is never rejected for it.
+  // array as its message, and the output it saves is snapshotted per run. Its
+  // configured message must be independently copyable, and the rule is the
+  // one cloneConfiguredValue shares with end-node results: a value the
+  // structured clone algorithm cannot deliver (a bare function or a function
+  // nested inside an object/array) is a definition error, and so is a value
+  // whose clone retains shared memory. The check runs for every message
+  // action, including actions on untaken branches and entry-unreachable ones.
+  // An action that names an operation ignores its message entirely, so an
+  // unused uncloneable or shared-memory message is never rejected for it.
   //
-  // A value that clones but whose clone retains shared memory is rejected for
-  // the same reason the run input and operation return values are: cloning a
-  // SharedArrayBuffer (or a typed array / DataView backed by one) "succeeds"
-  // while the clone keeps sharing the underlying bytes, so the independent
-  // output copy the action promises — including against the definition's own
-  // message, which the engine clones again at execution time — could not be
-  // guaranteed. The check therefore runs on the cloned value with the same
-  // clone-shaped traversal (containsSharedMemory): shared memory placed only
-  // where cloning drops it (an attached property of a Date/RegExp, a
-  // non-enumerable property, an Error own property other than cause) is
-  // discarded with that property and never condemns the message.
-  //
-  // Validation only proves the message was safe as it was then; the same two
-  // checks are re-enforced at the action's own execution moment by
-  // captureActionMessage below, exactly as for end-node results.
+  // Validation only proves the message was safe as it was then; the same rule
+  // is re-enforced at the action's own execution moment by
+  // captureActionMessage below.
   if (name === null && Object.hasOwn(node, 'message') && node.message !== undefined) {
-    let cloned;
-    try {
-      cloned = structuredClone(node.message);
-    } catch {
-      throw new Error(ACTION_MESSAGE_UNCLONEABLE_MESSAGE(node.id));
-    }
-    if (containsSharedMemory(cloned)) {
-      throw new Error(ACTION_MESSAGE_SHARED_MEMORY_MESSAGE(node.id));
-    }
+    cloneConfiguredValue(node.message, {
+      nodeId: node.id,
+      cloneFailureMessage: ACTION_MESSAGE_UNCLONEABLE_MESSAGE,
+      sharedMemoryFailureMessage: ACTION_MESSAGE_SHARED_MEMORY_MESSAGE,
+    });
   }
 
   return { name, retry, compensation };
@@ -462,20 +501,24 @@ const ACTION_MESSAGE_SHARED_MEMORY_MESSAGE = nodeId =>
 // replace a message's plain buffer with a shared one before this action
 // executes.
 //
+// The node-specific part lives here — the root value's single read and the
+// action:<node id> default — while the clone-and-judge rule itself is the one
+// cloneConfiguredValue shares with compileAction and the end-node result
+// functions:
+//
 //   - the root message is read exactly once here, and every nested enumerable
-//     accessor is read only by structuredClone's own read — there is no
+//     accessor is read only by the helper's structured clone — there is no
 //     separate inspection pass over the original, so a getter's return order
 //     is never disturbed, and the value this read produced is both what is
 //     judged and what is saved (a legal message whose getter answers with a
 //     different ordinary value at execution time saves that fresh value);
-//   - shared memory the clone retains is rejected (containsSharedMemory runs
-//     on the clone), while shared memory placed only where cloning drops it
-//     is discarded with that property and never condemns the message;
-//   - uncloneability takes precedence over shared memory, matching
-//     validation: the clone is attempted first and its failure short-circuits
-//     before the shared-memory traversal. A root getter that throws, a nested
-//     getter that throws while the clone reads it, and a value that cannot be
-//     cloned at all (a function) all surface as the same uncloneable error.
+//   - shared memory the clone retains is rejected, while shared memory placed
+//     only where cloning drops it is discarded with that property and never
+//     condemns the message;
+//   - uncloneability takes precedence over shared memory. A root getter that
+//     throws, a nested getter that throws while the clone reads it, and a
+//     value that cannot be cloned at all (a function) all surface as the same
+//     uncloneable error.
 //
 // An unset, undefined or null message still defaults to action:<node id>,
 // while "", 0 and false pass through untouched.
@@ -496,16 +539,11 @@ function captureActionMessage(node) {
     throw new Error(ACTION_MESSAGE_UNCLONEABLE_MESSAGE(node.id));
   }
   if (message === undefined || message === null) return `action:${node.id}`;
-  let cloned;
-  try {
-    cloned = structuredClone(message);
-  } catch {
-    throw new Error(ACTION_MESSAGE_UNCLONEABLE_MESSAGE(node.id));
-  }
-  if (containsSharedMemory(cloned)) {
-    throw new Error(ACTION_MESSAGE_SHARED_MEMORY_MESSAGE(node.id));
-  }
-  return cloned;
+  return cloneConfiguredValue(message, {
+    nodeId: node.id,
+    cloneFailureMessage: ACTION_MESSAGE_UNCLONEABLE_MESSAGE,
+    sharedMemoryFailureMessage: ACTION_MESSAGE_SHARED_MEMORY_MESSAGE,
+  });
 }
 
 // An end node's result is delivered to the caller verbatim for primitives
@@ -524,19 +562,19 @@ function captureActionMessage(node) {
 //     result before this end runs. Only the content this run will save is
 //     judged.
 //
-// The two failure kinds, in priority order: a value that cannot be
-// structured-cloned (a bare function, a function nested in an object/array, a
-// getter that throws, etc.), and a value that clones but whose clone retains
-// shared memory — cloning a SharedArrayBuffer (or a typed array / DataView
-// backed by one) "succeeds" while the clone keeps sharing the underlying
-// bytes, so the caller could rewrite the returned bytes and silently change
-// the definition and every later run. Uncloneability takes precedence when a
-// result carries both. As with legacy messages, run inputs and operation
-// returns, the clone is produced first and judged with containsSharedMemory:
-// only shared memory the clone actually retains condemns the result (an
-// attached property of a Date/RegExp, a non-enumerable or symbol-keyed
-// property, an Error own property other than cause are discarded by the clone
-// and never inspected).
+// The two failure kinds, in priority order, are exactly the ones
+// cloneConfiguredValue shares with legacy message actions: a value that
+// cannot be structured-cloned (a bare function, a function nested in an
+// object/array, a getter that throws, etc.), and a value that clones but
+// whose clone retains shared memory — cloning a SharedArrayBuffer (or a typed
+// array / DataView backed by one) "succeeds" while the clone keeps sharing
+// the underlying bytes, so the caller could rewrite the returned bytes and
+// silently change the definition and every later run. Uncloneability takes
+// precedence when a result carries both. The clone is produced first and
+// only the clone is judged, so only shared memory the clone actually retains
+// condemns the result (an attached property of a Date/RegExp, a
+// non-enumerable or symbol-keyed property, an Error own property other than
+// cause are discarded by the clone and never inspected).
 const END_RESULT_UNCLONEABLE_MESSAGE = nodeId =>
   `end node ${nodeId}: result must be a structured-cloneable value (objects and arrays must not contain functions)`;
 const END_RESULT_SHARED_MEMORY_MESSAGE = nodeId =>
@@ -544,15 +582,11 @@ const END_RESULT_SHARED_MEMORY_MESSAGE = nodeId =>
 
 function compileEndResult(node) {
   if (!Object.hasOwn(node, 'result') || node.result === undefined) return;
-  let cloned;
-  try {
-    cloned = structuredClone(node.result);
-  } catch {
-    throw new Error(END_RESULT_UNCLONEABLE_MESSAGE(node.id));
-  }
-  if (containsSharedMemory(cloned)) {
-    throw new Error(END_RESULT_SHARED_MEMORY_MESSAGE(node.id));
-  }
+  cloneConfiguredValue(node.result, {
+    nodeId: node.id,
+    cloneFailureMessage: END_RESULT_UNCLONEABLE_MESSAGE,
+    sharedMemoryFailureMessage: END_RESULT_SHARED_MEMORY_MESSAGE,
+  });
 }
 
 // Reads the end node's configured result at the node's own execution moment
@@ -560,21 +594,21 @@ function compileEndResult(node) {
 // re-enforces, for exactly the content this run is about to save, the promise
 // validation already made for the value as it was then:
 //
-//   - the value is read exactly once here, via structuredClone's own read.
+//   - the value is read exactly once here, by the helper's structured clone.
 //     There is no separate inspection pass over the original, so an
 //     enumerable getter's return order is never disturbed (the clone is the
 //     only read), and a getter that returned ordinary data during validation
 //     but returns shared memory — or a function — when this end executes is
 //     caught on the value that would actually have been saved;
-//   - shared memory the clone retains is rejected (containsSharedMemory runs
-//     on the clone), while shared memory placed only where cloning drops it
-//     is discarded with that property and never condemns an otherwise-legal
-//     result.
+//   - shared memory the clone retains is rejected, while shared memory placed
+//     only where cloning drops it is discarded with that property and never
+//     condemns an otherwise-legal result;
+//   - uncloneability takes precedence over shared memory.
 //
-// Uncloneability takes precedence over shared memory, matching validation:
-// the clone is attempted first and its failure short-circuits before the
-// shared-memory traversal. An unset, undefined or null result still becomes
-// null (structuredClone(null) === null), while 0, false and "" pass through.
+// The node-specific part lives here — the single root read via
+// `node.result ?? null`, by which an unset, undefined or null result becomes
+// null while 0, false and "" pass through — and the clone-and-judge rule
+// itself is the one cloneConfiguredValue shares with the message functions.
 //
 // Any failure is thrown here as an ordinary Error naming the end node rather
 // than recorded as a run status: the synchronous entry propagates it and the
@@ -583,23 +617,25 @@ function compileEndResult(node) {
 // business-action retries nor triggers compensation, and no "completed"
 // result is produced.
 function captureEndResult(node) {
-  let cloned;
+  // `node.result ?? null` is the root value's single read (an unset,
+  // undefined or null result becomes null; 0, false and "" pass through);
+  // every nested enumerable accessor is read only by the helper's structured
+  // clone, so this never adds a read that could change a getter's return
+  // order. A root getter that throws is caught here; a nested getter that
+  // throws while the clone reads it, and a value that cannot be cloned at all
+  // (a function), are caught inside the helper — all surface as the same
+  // end-node result error.
+  let root;
   try {
-    // `node.result ?? null` is the root value's single read (an unset,
-    // undefined or null result becomes null; 0, false and "" pass through);
-    // every nested enumerable accessor is read only by structuredClone, so
-    // this never adds a read that could change a getter's return order. A
-    // root getter that throws, a nested/root getter that throws while the
-    // clone reads it, and a value that cannot be cloned at all (a function)
-    // all surface as the same end-node result error.
-    cloned = structuredClone(node.result ?? null);
+    root = node.result ?? null;
   } catch {
     throw new Error(END_RESULT_UNCLONEABLE_MESSAGE(node.id));
   }
-  if (containsSharedMemory(cloned)) {
-    throw new Error(END_RESULT_SHARED_MEMORY_MESSAGE(node.id));
-  }
-  return cloned;
+  return cloneConfiguredValue(root, {
+    nodeId: node.id,
+    cloneFailureMessage: END_RESULT_UNCLONEABLE_MESSAGE,
+    sharedMemoryFailureMessage: END_RESULT_SHARED_MEMORY_MESSAGE,
+  });
 }
 
 // Resolves the outgoing edges of a node. Trigger, form and action nodes may
