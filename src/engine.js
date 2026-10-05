@@ -883,8 +883,178 @@ function processFormField(spec, input, nodeId) {
   return null;
 }
 
+// Error interfaces structuredClone can recreate, keyed by the instance name
+// the host switch uses; every other name becomes a plain Error.
+const NAMED_ERROR_CONSTRUCTORS = new Map([
+  ['Error', Error],
+  ['EvalError', EvalError],
+  ['RangeError', RangeError],
+  ['ReferenceError', ReferenceError],
+  ['SyntaxError', SyntaxError],
+  ['TypeError', TypeError],
+  ['URIError', URIError],
+]);
+
+// Snapshot of the run input taken the instant a form starts processing, used
+// to undo that form's own writes when validation fails. A plain
+// structuredClone is not enough: a successful earlier form may have attached
+// a default as an own property of a value structuredClone copies only by
+// internal slot — a Date most notably, but also RegExp, Map/Set, buffers and
+// views or boxed primitives. structuredClone discards every property attached
+// to such a value, so restoring a per-form structuredClone would delete the
+// earlier form's successful defaults together with the failed form's writes.
+// The working input is itself the entry-time structured clone (and forms only
+// ever add plain parent objects and primitive defaults), so every value here
+// is structured-cloneable and carries no shared memory. This clone walks that
+// graph itself, recreating each structured-clone kind while (a) keeping the
+// own enumerable properties structuredClone would drop from internal-slot
+// values and (b) preserving repeated and circular references — including ones
+// that cross between plain objects and containers — through a source->clone
+// identity map. The result is independent of the working input at every level.
+function cloneFormInputState(input) {
+  return cloneValue(input, new Map());
+}
+
+function cloneValue(value, clones) {
+  if (value === null || typeof value !== 'object') return value;
+  const existing = clones.get(value);
+  if (existing !== undefined) return existing;
+
+  // Containers: recreate the entries/members (references resolved through the
+  // same map, so cycles through a container survive), then carry over any own
+  // enumerable properties attached to the container itself.
+  if (nodeTypes.isMap(value)) {
+    const copy = new Map();
+    clones.set(value, copy);
+    for (const [key, member] of value) copy.set(cloneValue(key, clones), cloneValue(member, clones));
+    copyEnumerableOwnProps(value, copy, clones);
+    return copy;
+  }
+  if (nodeTypes.isSet(value)) {
+    const copy = new Set();
+    clones.set(value, copy);
+    for (const member of value) copy.add(cloneValue(member, clones));
+    copyEnumerableOwnProps(value, copy, clones);
+    return copy;
+  }
+
+  if (nodeTypes.isDate(value)) {
+    const copy = new Date(value.getTime());
+    clones.set(value, copy);
+    copyEnumerableOwnProps(value, copy, clones);
+    return copy;
+  }
+  if (nodeTypes.isRegExp(value)) {
+    const copy = new RegExp(value.source, value.flags);
+    clones.set(value, copy);
+    copyEnumerableOwnProps(value, copy, clones);
+    return copy;
+  }
+
+  // Buffers and views. The view is rebuilt over the same single clone of its
+  // backing buffer (read through the internal-slot getter so a shadowing own
+  // "buffer" property cannot fool us, and resolved through the map so two
+  // views that share a buffer keep sharing one clone), with the view's
+  // original byte offset and length.
+  if (nodeTypes.isArrayBuffer(value)) {
+    const copy = value.slice(0);
+    clones.set(value, copy);
+    copyEnumerableOwnProps(value, copy, clones);
+    return copy;
+  }
+  if (nodeTypes.isTypedArray(value)) {
+    const buffer = cloneValue(TYPED_ARRAY_BUFFER_GETTER.call(value), clones);
+    const copy = new value.constructor(buffer, value.byteOffset, value.length);
+    clones.set(value, copy);
+    // Elements already come from the shared buffer; copy only the non-index
+    // own properties (expando defaults a form is allowed to attach here),
+    // which structuredClone would otherwise drop.
+    copyNonIndexOwnProps(value, copy, clones);
+    return copy;
+  }
+  if (nodeTypes.isDataView(value)) {
+    const buffer = cloneValue(DATAVIEW_BUFFER_GETTER.call(value), clones);
+    const copy = new DataView(buffer, value.byteOffset, value.byteLength);
+    clones.set(value, copy);
+    copyEnumerableOwnProps(value, copy, clones);
+    return copy;
+  }
+
+  if (nodeTypes.isNativeError(value)) {
+    // structuredClone selects the error interface by the instance's `name`;
+    // unknown names (subclasses, AggregateError) collapse to a plain Error.
+    const Ctor = NAMED_ERROR_CONSTRUCTORS.get(value.name) || Error;
+    const copy = new Ctor(value.message);
+    clones.set(value, copy);
+    if (Object.hasOwn(value, 'cause')) {
+      // "cause" is cloned as a non-enumerable own property, exactly as the
+      // host clone stores it.
+      Object.defineProperty(copy, 'cause', {
+        value: cloneValue(value.cause, clones),
+        writable: true, enumerable: false, configurable: true,
+      });
+    }
+    copyEnumerableOwnProps(value, copy, clones);
+    return copy;
+  }
+
+  if (nodeTypes.isBoxedPrimitive(value)) {
+    let copy;
+    if (nodeTypes.isNumberObject(value)) copy = new Number(value.valueOf());
+    else if (nodeTypes.isStringObject(value)) copy = new String(value.valueOf());
+    else if (nodeTypes.isBooleanObject(value)) copy = new Boolean(value.valueOf());
+    else copy = Object(value.valueOf()); // boxed BigInt or Symbol
+    clones.set(value, copy);
+    copyEnumerableOwnProps(value, copy, clones);
+    return copy;
+  }
+
+  // Arrays: assigning only the enumerable own keys leaves holes intact and
+  // lets index assignments grow the length, matching structuredClone.
+  if (Array.isArray(value)) {
+    const copy = [];
+    clones.set(value, copy);
+    for (const key of Object.keys(value)) copy[key] = cloneValue(value[key], clones);
+    return copy;
+  }
+
+  // Plain objects and arbitrary class instances without a structured-clone
+  // internal slot clone as plain objects carrying their own enumerable
+  // string-keyed properties, exactly as structuredClone treats them.
+  const copy = {};
+  clones.set(value, copy);
+  copyEnumerableOwnProps(value, copy, clones);
+  return copy;
+}
+
+// Copies the source's own enumerable string-keyed properties onto the target,
+// cloning each value through the shared identity map. That is the property set
+// structuredClone copies for ordinary objects — and the one it silently drops
+// from internal-slot values such as Date, where form defaults nevertheless
+// land and must survive a later form's rollback.
+function copyEnumerableOwnProps(source, target, clones) {
+  for (const key of Object.keys(source)) {
+    target[key] = cloneValue(source[key], clones);
+  }
+}
+
+// Like copyEnumerableOwnProps, but skips a typed array's numeric index keys
+// below its length: its elements are already copied byte-for-byte through the
+// shared buffer, so only the attached non-index properties (expando defaults)
+// need carrying.
+function copyNonIndexOwnProps(source, target, clones) {
+  for (const key of Object.keys(source)) {
+    const index = Number(key);
+    if (Number.isInteger(index) && index >= 0 && index < source.length
+      && String(index) === key) {
+      continue;
+    }
+    target[key] = cloneValue(source[key], clones);
+  }
+}
+
 function processForm(node, input, compiled) {
-  const snapshot = structuredClone(input);
+  const snapshot = cloneFormInputState(input);
   const errors = [];
   for (const spec of compiled) {
     const fieldError = processFormField(spec, input, node.id);
