@@ -420,6 +420,187 @@ test('rejects malformed condition definitions before execution, including untake
   assert.throws(() => executeWorkflow(branched, { route: 'b' }), /unknown condition operator/);
 });
 
+test('rejects all/any child holes at their original position, never treating them as false', () => {
+  const comparison = { field: 'a', operator: 'exists' };
+
+  const holeyDefinitions = [
+    // Length but no elements at all.
+    () => ({ all: new Array(2) }),
+    () => ({ any: new Array(1) }),
+    // Hole between valid children (the slot left by deleting an entry).
+    () => {
+      const children = [comparison, comparison, comparison];
+      delete children[1];
+      return { all: children };
+    },
+    // Trailing hole after a valid child.
+    () => {
+      const children = [comparison];
+      children.length = 2;
+      return { any: children };
+    },
+    // Hole in front, valid child behind it.
+    () => {
+      const children = [comparison];
+      delete children[0];
+      children.push(comparison);
+      return { all: children };
+    },
+  ];
+  const expectedPositions = [
+    '$.all[0]', '$.any[0]', '$.all[1]', '$.any[1]', '$.all[0]',
+  ];
+
+  for (let i = 0; i < holeyDefinitions.length; i += 1) {
+    const condition = holeyDefinitions[i]();
+    const key = Object.keys(condition)[0];
+    const index = expectedPositions[i].match(/\[(\d+)\]/)[1];
+    try {
+      validateWorkflow(conditionWorkflow(condition));
+      assert.fail('expected a hole to be rejected');
+    } catch (error) {
+      assert.match(error.message, new RegExp(`condition node check at \\$\\.${key}\\[${index}\\]: ${key}\\[${index}\\] is a missing child condition`));
+    }
+  }
+
+  // Nested holes keep the full root-to-hole path through all, any and not.
+  const nested = { all: [{ not: { any: [comparison, comparison] } }] };
+  delete nested.all[0].not.any[1];
+  assert.throws(
+    () => validateWorkflow(conditionWorkflow(nested)),
+    /condition node check at \$\.all\[0\]\.not\.any\[1\]: any\[1\] is a missing child condition/,
+  );
+  const nestedHole = { any: [{ all: [comparison] }, comparison] };
+  nestedHole.any[0].all.length = 2;
+  assert.throws(
+    () => validateWorkflow(conditionWorkflow(nestedHole)),
+    /condition node check at \$\.any\[0\]\.all\[1\]/,
+  );
+});
+
+test('holes are rejected even when earlier children decide the result', () => {
+  const truthy = { field: 'a', operator: 'eq', value: 1 };
+  const falsy = { field: 'a', operator: 'eq', value: 2 };
+
+  // any[0] would already be true; all[0] would already be false — the
+  // trailing hole must still stop the definition, for every input.
+  const anyWithHole = { any: [truthy] };
+  anyWithHole.any.length = 2;
+  assert.throws(() => validateWorkflow(conditionWorkflow(anyWithHole)), /\$\.any\[1\].*missing child condition/);
+
+  const allWithHole = { all: [falsy] };
+  allWithHole.all.length = 2;
+  assert.throws(() => validateWorkflow(conditionWorkflow(allWithHole)), /\$\.all\[1\].*missing child condition/);
+
+  // The synchronous entry throws before the first node runs, so no action
+  // ahead of the condition can execute even on an input that short-circuits.
+  assert.throws(
+    () => executeWorkflow(conditionWorkflow(anyWithHole, { before: 'prep' }), { a: 1 }),
+    /condition node check at \$\.any\[1\].*missing child condition/,
+  );
+  assert.throws(
+    () => executeWorkflow(conditionWorkflow(allWithHole, { before: 'prep' }), { a: 1 }),
+    /condition node check at \$\.all\[1\].*missing child condition/,
+  );
+});
+
+test('holes in untaken or entry-unreachable condition nodes are still rejected', () => {
+  const untakenChildren = [{ field: 'x', operator: 'exists' }];
+  untakenChildren.length = 2; // hole at index 1
+  const unreachableChildren = [{ field: 'y', operator: 'exists' }, { field: 'z', operator: 'exists' }];
+  delete unreachableChildren[0]; // hole at index 0
+
+  const workflow = {
+    id: 'untaken-hole', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'route' },
+      { id: 'route', type: 'condition', condition: { field: 'route', operator: 'eq', value: 'a' }, then: 'a', else: 'b' },
+      { id: 'a', type: 'condition', condition: { all: untakenChildren }, then: 'end', else: 'end' },
+      { id: 'b', type: 'end', result: 'b' },
+      { id: 'dormant', type: 'condition', condition: { any: unreachableChildren }, then: 'end', else: 'end' },
+      { id: 'end', type: 'end', result: 'end' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(workflow), /condition node a at \$\.all\[1\].*missing child condition/);
+  // The run takes branch b; the hole on branch a is still a definition error.
+  assert.throws(() => executeWorkflow(workflow, { route: 'b' }), /condition node a at \$\.all\[1\]/);
+
+  const onlyDormant = {
+    id: 'dormant-hole', entry: 'start', nodes: [
+      { id: 'start', type: 'trigger', next: 'end' },
+      { id: 'ghost', type: 'condition', condition: { any: unreachableChildren }, then: 'end', else: 'end' },
+      { id: 'end', type: 'end', result: 'end' },
+    ],
+  };
+  assert.throws(() => validateWorkflow(onlyDormant), /condition node ghost at \$\.any\[0\].*missing child condition/);
+});
+
+test('explicit undefined and null children keep the existing non-condition rule', () => {
+  // [undefined] and [null] carry an own property at index 0: they are present
+  // non-condition values, distinct from a missing slot.
+  assert.throws(
+    () => validateWorkflow(conditionWorkflow({ all: [undefined] })),
+    /condition node check at \$\.all\[0\]: condition must be an object/,
+  );
+  assert.throws(
+    () => validateWorkflow(conditionWorkflow({ any: [{ field: 'a', operator: 'exists' }, null] })),
+    /condition node check at \$\.any\[1\]: condition must be an object/,
+  );
+});
+
+test('rejecting a hole never mutates the caller condition array or definition', () => {
+  const children = [{ field: 'a', operator: 'exists' }, { field: 'b', operator: 'exists' }];
+  delete children[1];
+  const workflow = conditionWorkflow({ all: children });
+
+  assert.throws(() => validateWorkflow(workflow), /missing child condition/);
+
+  assert.equal(children.length, 2);
+  assert.equal(Object.hasOwn(children, 0), true);
+  assert.equal(Object.hasOwn(children, 1), false);
+  assert.strictEqual(workflow.nodes[1].condition.all, children);
+  assert.deepEqual(children[0], { field: 'a', operator: 'exists' });
+});
+
+test('dense child arrays keep evaluating and short-circuiting as before', () => {
+  const denseAll = { all: [{ field: 'a', operator: 'gte', value: 5 }, { field: 'bad', operator: 'gte', value: 0 }] };
+  const denseAny = { any: [{ field: 'a', operator: 'gte', value: 0 }, { field: 'bad', operator: 'gte', value: 0 }] };
+  assert.equal(branchOf(denseAll, { a: 1, bad: {} }), 'failed');
+  assert.equal(branchOf(denseAny, { a: 1, bad: {} }), 'passed');
+  // A non-skipped bad child still reports an ordinary invalid_condition.
+  assert.equal(
+    executeWorkflow(conditionWorkflow({ all: [{ field: 'a', operator: 'gte', value: 0 }, { field: 'bad', operator: 'gte', value: 0 }] }), { a: 1, bad: {} }).status,
+    'invalid_condition',
+  );
+});
+
+test('the asynchronous entry rejects on a child hole without running or compensating actions', async () => {
+  // any[0] is true for this input, so evaluation would short-circuit before
+  // the trailing hole — the promise must still reject without any action.
+  const children = [{ field: 'a', operator: 'eq', value: 1 }];
+  children.length = 2;
+  const workflow = {
+    id: 'hole-async', entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'check' },
+      { id: 'check', type: 'condition', condition: { any: children }, then: 'work', else: 'end' },
+      { id: 'work', type: 'action', operation: 'charge', compensation: { operation: 'refund' }, next: 'end' },
+      { id: 'end', type: 'end', result: 'done' },
+    ],
+  };
+  let charged = 0;
+  let refunded = 0;
+  await assert.rejects(
+    () => executeWorkflowAsync(workflow, { a: 1 }, {
+      charge: () => { charged += 1; return 'charged'; },
+      refund: () => { refunded += 1; return 'refunded'; },
+    }),
+    error => /condition node check at \$\.any\[1\]/.test(error.message)
+      && /missing child condition/.test(error.message),
+  );
+  assert.equal(charged, 0);
+  assert.equal(refunded, 0);
+});
+
 test('nests up to 32 levels and rejects the 33rd, reporting the position', () => {
   const nested = depth => {
     let condition = { field: 'x', operator: 'exists' };

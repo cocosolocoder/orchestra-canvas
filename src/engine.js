@@ -217,17 +217,30 @@ function compileCondition(condition, nodes, nodeId, position = '$', depth = 1) {
     if (key === 'not') {
       return { kind: 'not', child: compileCondition(condition.not, nodes, nodeId, `${position}.not`, depth + 1) };
     }
-    if (!Array.isArray(condition[key])) {
+    const childList = condition[key];
+    if (!Array.isArray(childList)) {
       throw new Error(`condition node ${nodeId} at ${position}: ${key} must be an array of conditions`);
     }
-    if (condition[key].length === 0) {
+    if (childList.length === 0) {
       throw new Error(`condition node ${nodeId} at ${position}: ${key} must not be empty`);
     }
-    return {
-      kind: key,
-      children: condition[key].map((child, index) =>
-        compileCondition(child, nodes, nodeId, `${position}.${key}[${index}]`, depth + 1)),
-    };
+    // A non-empty array may still carry length without a condition at every
+    // slot: a child deleted through the JavaScript API can leave a hole, or
+    // the array may have been allocated with gaps only. A missing slot is a
+    // definition error at its own original index — it is never treated as
+    // false, skipped over or filled in — so it is reported even when an
+    // earlier sibling would already short-circuit the compound. Explicit
+    // undefined/null entries are not holes: they remain present and fall
+    // through to the ordinary "condition must be an object" rejection.
+    const children = [];
+    for (let index = 0; index < childList.length; index += 1) {
+      if (!Object.hasOwn(childList, index)) {
+        throw new Error(`condition node ${nodeId} at ${position}.${key}[${index}]: ${key}[${index}] is a missing child condition`);
+      }
+      children.push(
+        compileCondition(childList[index], nodes, nodeId, `${position}.${key}[${index}]`, depth + 1));
+    }
+    return { kind: key, children };
   }
 
   const where = `condition node ${nodeId} at ${position}`;
