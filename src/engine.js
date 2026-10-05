@@ -1287,6 +1287,107 @@ function cloneRunInput(input) {
   return copy.copy;
 }
 
+// Builds the independent input copy handed to a single business attempt or
+// stored (and later handed, again copied, to compensation) at an action's
+// success moment.
+//
+// A plain structuredClone is almost that copy, but it cannot carry a default
+// a successful form adds onto a host object during the run: forms apply
+// defaults as ordinary own properties on the live run input, so the input
+// itself and the following conditions see them at once, but structuredClone
+// reproduces a Date (and every other clone-special node — RegExp, Map/Set own
+// properties, byte views, Errors apart from "cause", boxed primitives) from
+// its internal value alone and silently drops every attached own property.
+// The business action's argument copy, the compensation snapshot and each
+// compensation attempt's copy therefore lost exactly the run-time form
+// defaults, while plain-object defaults kept working.
+//
+// Receiver-time handling is unchanged: cloneRunInput already discarded the
+// own properties the CALLER attached to such an object before the run, and
+// forms only ever add properties (never remove another form's survivors), so
+// within a run every own property of a live node that is missing from its
+// structured-clone counterpart is precisely a subtree a successful form
+// created there — primitive defaults at the leaves and fresh plain-object
+// parents along the path. This walks the live graph and its clone in
+// lockstep, reattaches an independent copy of each such dropped subtree, and
+// otherwise leaves the clone exactly as structuredClone produced it:
+//  - the Date keeps its original type and time value, the default merely
+//    joins it as an own property;
+//  - the whole multi-level path a default created is reattached together;
+//  - identity the clone preserved is kept — when two input fields point at
+//    one Date, both still point at the single reattached clone node inside
+//    this copy (each invocation gets its own copy, so retries and the live
+//    run input stay independent of one another);
+//  - a reattached subtree is itself structured-cloned, so an action or
+//    compensation editing a default, a created parent or the Date itself
+//    cannot reach the run input, the caller's input or any other copy.
+function copyInputWithFormDefaults(input) {
+  const clone = structuredClone(input);
+  const processed = new Set();
+  // Pairs of [live node, its clone counterpart]. The lockstep walk follows
+  // enumerable own properties — the same protocol forms and lookupOwn
+  // navigate by — on plain objects, host objects and arrays alike, mirroring
+  // the clone graph node for node. (Form paths may not cross an array
+  // intermediate — such a default is a type error — but descending into
+  // arrays anyway keeps the pairing total and harmless.) The internal entries
+  // of Map/Set and the slots of byte views are unreachable by own-property
+  // paths and need no pairing.
+  const stack = [[input, clone]];
+  const isTraversable = value => value !== null && typeof value === 'object';
+  while (stack.length > 0) {
+    const [source, target] = stack.pop();
+    if (processed.has(source)) continue;
+    processed.add(source);
+
+    let keys;
+    try {
+      keys = Object.keys(source);
+    } catch {
+      continue;
+    }
+    for (const key of keys) {
+      let sourceValue;
+      try {
+        sourceValue = source[key];
+      } catch {
+        continue;
+      }
+      let targetHasProperty;
+      try {
+        targetHasProperty = Object.hasOwn(target, key);
+      } catch {
+        targetHasProperty = false;
+      }
+      if (!targetHasProperty) {
+        // The clone dropped this own property: a run-time form default riding
+        // on a clone-special node (an own property of a Date, of a Map/Set,
+        // and so on). Form-created subtrees hold only primitives and fresh
+        // plain objects, so this clone always succeeds; cloning here detaches
+        // the reattached subtree from the live run input. Define an own data
+        // property rather than assigning, so no inherited setter (e.g. an
+        // object's __proto__) can intercept the reattachment.
+        if (sourceValue !== undefined) {
+          Object.defineProperty(target, key, {
+            value: structuredClone(sourceValue),
+            writable: true, enumerable: true, configurable: true,
+          });
+        }
+        continue;
+      }
+      let targetValue;
+      try {
+        targetValue = target[key];
+      } catch {
+        continue;
+      }
+      if (isTraversable(sourceValue) && isTraversable(targetValue)) {
+        stack.push([sourceValue, targetValue]);
+      }
+    }
+  }
+  return clone;
+}
+
 // Runs an operation under a retry policy — the one attempt loop shared by
 // business actions and compensations. Every invocation works on fresh
 // structured-clone argument copies produced by prepareArgs, so mutations by
@@ -1388,15 +1489,18 @@ async function runWithRetries({
 }
 
 // Runs one business action with retries. Every invocation receives fresh
-// structured clones of the current input and the successful outputs so far;
-// the stored success value is a clone independent of any object the
-// implementation keeps holding. The cancellation signal applies to this
-// loop only — compensation runs without one.
+// independent copies of the current input and the successful outputs so far;
+// the input copy goes through copyInputWithFormDefaults rather than a bare
+// structured clone, so defaults a successful form added onto a Date (or any
+// clone-special object) during this run stay readable while the Date keeps
+// its type and time. The stored success value is a clone independent of any
+// object the implementation keeps holding. The cancellation signal applies
+// to this loop only — compensation runs without one.
 async function runBusinessAction(node, binding, implementation, context, actionAttempts, signal) {
   return runWithRetries({
     retry: binding.retry,
     signal,
-    prepareArgs: attempt => [structuredClone(context.input), structuredClone(context.output), node.id, attempt],
+    prepareArgs: attempt => [copyInputWithFormDefaults(context.input), structuredClone(context.output), node.id, attempt],
     invoke: implementation,
     createRecord: attempt => ({ nodeId: node.id, attempt, ok: false, error: null, nextDelayMs: 0 }),
     copyFailureMessages: {
@@ -1409,16 +1513,21 @@ async function runBusinessAction(node, binding, implementation, context, actionA
 }
 
 // Runs compensation for one already-succeeded business action. The call gets
-// independent structured clones of the input and earlier outputs captured at
-// the original action's success moment, the stored return value, the node id
-// and a 1-based compensation attempt number. Nothing here can touch the run
-// context, a later attempt, another run, or the stored success output.
+// independent copies of the input and earlier outputs captured at the
+// original action's success moment, the stored return value, the node id and
+// a 1-based compensation attempt number. The input snapshot was captured via
+// copyInputWithFormDefaults and is copied again through it per attempt, so
+// the success-moment form defaults — including ones attached to a Date —
+// reach every attempt while remaining detached from it: mutating them, the
+// Date or a created parent on one failed attempt cannot touch the snapshot,
+// the run context, a later attempt, another run, or the stored success
+// output.
 async function runCompensation(entry, implementation, records) {
   const { nodeId, binding, snapshot } = entry;
   return runWithRetries({
     retry: binding.compensation.retry,
     prepareArgs: attempt => [
-      structuredClone(snapshot.input), structuredClone(snapshot.output),
+      copyInputWithFormDefaults(snapshot.input), structuredClone(snapshot.output),
       structuredClone(snapshot.result), nodeId, attempt,
     ],
     invoke: implementation,
@@ -1763,9 +1872,13 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
         }
         // Capture the compensation snapshots from the state before the new
         // output key lands: the action's own return value is handed to the
-        // compensation separately as its third argument.
+        // compensation separately as its third argument. The input snapshot
+        // goes through copyInputWithFormDefaults, so it freezes exactly the
+        // defaults already effective at this action's success moment —
+        // including ones a form attached to a Date — while fields a later
+        // form adds to the live run input can never enter it.
         const compensationSnapshot = binding.compensation === null ? null : {
-          input: structuredClone(state.context.input),
+          input: copyInputWithFormDefaults(state.context.input),
           output: structuredClone(state.context.output),
           result: structuredClone(actionResult.value),
         };
