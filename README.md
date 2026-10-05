@@ -97,6 +97,203 @@ The whole condition tree of every condition node is checked at definition time �
 
 At execution time, a numeric comparison that is actually evaluated (i.e. not short-circuited away) against an object, an array, or a value that does not convert to a finite number stops the workflow with `status: "invalid_condition"`, reporting the node id, child position, and reason. The `context` and `trace` are preserved; the trace contains the failing condition node and no further nodes execute. Earlier successful business actions are compensated under the usual rules.
 
+### Branching on an action output: a reference is not a dependency
+
+An output reference and a dependency answer different questions: `outputField` says *what* the condition reads; `dependsOn` says *when* it may run. A reference by itself neither waits for nor activates the action it names, so a condition that must judge a business action's result needs both — point `outputField` at the action and list that same action in `dependsOn`. The example below is complete and runs through the asynchronous entry: the entry activates the condition and the scoring action together, the condition is declared **before** the action but declares the dependency, and both exits lead to the same `end` node.
+
+```js
+import { executeWorkflowAsync } from './src/engine.js';
+
+const workflow = {
+  id: 'application-scoring',
+  entry: 'start',
+  nodes: [
+    { id: 'start', type: 'trigger', next: ['score-gate', 'score-applicant'] },
+    {
+      id: 'score-gate',
+      type: 'condition',
+      dependsOn: ['score-applicant'],
+      condition: {
+        outputField: { nodeId: 'score-applicant', path: 'score' },
+        operator: 'gte',
+        valueField: 'threshold',
+      },
+      then: 'approved',
+      else: 'review',
+    },
+    { id: 'score-applicant', type: 'action', operation: 'score', next: 'finish' },
+    { id: 'approved', type: 'action', message: 'Applicant approved', next: 'finish' },
+    { id: 'review', type: 'action', message: 'Queued for manual review', next: 'finish' },
+    { id: 'finish', type: 'end', result: 'finished' },
+  ],
+};
+
+const operations = {
+  // Business operation that computes a 0-100 score from the run input.
+  score: (input) => ({ score: Math.min(100, input.signals.onTimePayments * 10) }),
+};
+
+const aboveThreshold = { threshold: 80, signals: { onTimePayments: 9 } }; // score 90
+const belowThreshold = { threshold: 80, signals: { onTimePayments: 6 } }; // score 60
+
+console.log(await executeWorkflowAsync(workflow, aboveThreshold, operations));
+console.log(await executeWorkflowAsync(workflow, belowThreshold, operations));
+```
+
+With `aboveThreshold` the saved score `90` is at least the input threshold `80`, so the condition selects `then` and the run ends on the shared end node through the approval branch:
+
+```json
+{
+  "status": "completed",
+  "result": "finished",
+  "context": {
+    "input": { "threshold": 80, "signals": { "onTimePayments": 9 } },
+    "output": {
+      "score-applicant": { "score": 90 },
+      "approved": "Applicant approved"
+    }
+  },
+  "trace": [
+    { "nodeId": "start", "type": "trigger" },
+    { "nodeId": "score-applicant", "type": "action" },
+    { "nodeId": "score-gate", "type": "condition" },
+    { "nodeId": "approved", "type": "action" },
+    { "nodeId": "finish", "type": "end" }
+  ],
+  "actionAttempts": [
+    { "nodeId": "score-applicant", "attempt": 1, "ok": true, "error": null, "nextDelayMs": 0 }
+  ],
+  "compensationStatus": "not_needed",
+  "compensationAttempts": []
+}
+```
+
+With `belowThreshold` the score is `60`, so the same end node is reached through the other branch instead:
+
+```json
+{
+  "status": "completed",
+  "result": "finished",
+  "context": {
+    "input": { "threshold": 80, "signals": { "onTimePayments": 6 } },
+    "output": {
+      "score-applicant": { "score": 60 },
+      "review": "Queued for manual review"
+    }
+  },
+  "trace": [
+    { "nodeId": "start", "type": "trigger" },
+    { "nodeId": "score-applicant", "type": "action" },
+    { "nodeId": "score-gate", "type": "condition" },
+    { "nodeId": "review", "type": "action" },
+    { "nodeId": "finish", "type": "end" }
+  ],
+  "actionAttempts": [
+    { "nodeId": "score-applicant", "attempt": 1, "ok": true, "error": null, "nextDelayMs": 0 }
+  ],
+  "compensationStatus": "not_needed",
+  "compensationAttempts": []
+}
+```
+
+The traces make the rule visible:
+
+- Although `score-gate` is declared first and is active from the start, it is not eligible while `score-applicant` is incomplete, so the action runs first; the condition evaluates exactly once, after that output is saved — with the output present, `90 >= 80` is true and `60 >= 80` is false.
+- The unchosen exit never activates its target: `review` appears in neither the trace nor the output of the first run, and `approved` appears in neither in the second. Both branches converge on the single `finish` end node.
+- The score is stored under `context.output` keyed by the action id and is **not** written back to `context.input`, which stays exactly as the caller passed it.
+- `gte` is inclusive: an input of `{ "threshold": 80, "signals": { "onTimePayments": 8 } }` produces a score of exactly `80` and takes the `approved` branch.
+
+#### Forgetting the dependency
+
+If `dependsOn` is removed from `score-gate`, both nodes are still activated by the entry's array successors, but nothing gates the condition anymore. Scheduling always picks the eligible node earliest in `nodes` declaration order, so `score-gate` runs first. At that moment `score-applicant` has not run; the reference reads a missing output, and an ordinary comparison with a missing side is false — the condition takes the `else` branch. Re-running the example above (`score` would return `90`, which ought to pass) now yields:
+
+```json
+{
+  "status": "completed",
+  "result": "finished",
+  "context": {
+    "input": { "threshold": 80, "signals": { "onTimePayments": 9 } },
+    "output": {
+      "score-applicant": { "score": 90 },
+      "review": "Queued for manual review"
+    }
+  },
+  "trace": [
+    { "nodeId": "start", "type": "trigger" },
+    { "nodeId": "score-gate", "type": "condition" },
+    { "nodeId": "score-applicant", "type": "action" },
+    { "nodeId": "review", "type": "action" },
+    { "nodeId": "finish", "type": "end" }
+  ],
+  "actionAttempts": [
+    { "nodeId": "score-applicant", "attempt": 1, "ok": true, "error": null, "nextDelayMs": 0 }
+  ],
+  "compensationStatus": "not_needed",
+  "compensationAttempts": []
+}
+```
+
+The reference did not make the condition wait, did not activate the action, and added no dependency; when `score-applicant` succeeds a moment later and saves `90`, the already-completed condition is not re-evaluated, so the `review` branch stands even though the output would now satisfy the threshold. This is deterministic declaration-order scheduling, not a race: making the operation return faster or slower cannot change the node order, so operation timing must not be used to arrange sequencing — declare the dependency instead.
+
+#### A dependency cannot activate a node
+
+`dependsOn` only gates when an already-activated node may execute; it never activates the dependency. If the condition is activated but no actually traversed edge activates the scoring action, the condition waits forever and the run ends `blocked`. Changing only the entry successor in the workflow above so it activates the condition alone demonstrates this (the scoring action's definition, including its own `next`, still has to pass validation even though nothing reaches it):
+
+```js
+const blockedWorkflow = {
+  id: 'application-scoring-blocked',
+  entry: 'start',
+  nodes: [
+    { id: 'start', type: 'trigger', next: 'score-gate' },
+    {
+      id: 'score-gate',
+      type: 'condition',
+      dependsOn: ['score-applicant'],
+      condition: {
+        outputField: { nodeId: 'score-applicant', path: 'score' },
+        operator: 'gte',
+        valueField: 'threshold',
+      },
+      then: 'approved',
+      else: 'review',
+    },
+    { id: 'score-applicant', type: 'action', operation: 'score', next: 'finish' },
+    { id: 'approved', type: 'action', message: 'Applicant approved', next: 'finish' },
+    { id: 'review', type: 'action', message: 'Queued for manual review', next: 'finish' },
+    { id: 'finish', type: 'end', result: 'finished' },
+  ],
+};
+
+const result = await executeWorkflowAsync(
+  blockedWorkflow,
+  { threshold: 80, signals: { onTimePayments: 9 } },
+  operations,
+);
+```
+
+The `score` operation is never invoked, and the result is:
+
+```json
+{
+  "status": "blocked",
+  "context": {
+    "input": { "threshold": 80, "signals": { "onTimePayments": 9 } },
+    "output": {}
+  },
+  "trace": [
+    { "nodeId": "start", "type": "trigger" }
+  ],
+  "blockedNodes": [
+    { "nodeId": "score-gate", "missingDependencies": ["score-applicant"] }
+  ],
+  "actionAttempts": [],
+  "compensationStatus": "not_needed",
+  "compensationAttempts": []
+}
+```
+
+The run processes everything else it can and then preserves the records produced so far — the completed `start` stays in the trace and any earlier successful outputs stay in `context.output` — while reporting the waiting node and the missing activation in `blockedNodes`. `score-gate` has no trace entry because it never executed: it produced no branch result, so neither `approved` nor `review` was activated and `finish` was never reached.
+
 ## Form input validation
 
 A `form` node may carry a `schema` object with a `fields` array. Fields are processed in declaration order; a form without a schema passes input through unchanged. Each field declares:
