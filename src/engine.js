@@ -844,7 +844,17 @@ function runCondition(compiled, input, output, nodeId, position = '$') {
   };
 }
 
-function applyDefault(root, segments, value) {
+// Applies one field default, recording every write in `undo` as [object, key]
+// pairs — one per parent object created along the path, then the leaf itself —
+// so a failed form can remove exactly its own additions afterwards. A default
+// only ever adds own properties (the field was missing, and missing parents
+// are created as fresh objects), so deleting those keys in reverse order
+// restores the input to precisely its pre-form state: values and objects that
+// predate the form — including own properties an earlier successful form
+// added, on plain objects and on host objects such as a Date — are never
+// touched, and the existing reference graph (shared or circular references)
+// is kept as-is rather than replaced by a clone.
+function applyDefault(root, segments, value, undo) {
   let current = root;
   for (let i = 0; i < segments.length - 1; i += 1) {
     const part = segments[i];
@@ -855,20 +865,23 @@ function applyDefault(root, segments, value) {
     } else {
       const created = {};
       current[part] = created;
+      undo.push([current, part]);
       current = created;
     }
   }
-  current[segments[segments.length - 1]] = value;
+  const leaf = segments[segments.length - 1];
+  current[leaf] = value;
+  undo.push([current, leaf]);
   return true;
 }
 
-function processFormField(spec, input, nodeId) {
+function processFormField(spec, input, nodeId, undo) {
   const error = code => ({ nodeId, path: spec.path, code });
   const { exists, value } = lookupOwn(input, spec.segments);
 
   if (!exists) {
     if (spec.hasDefault) {
-      if (!isUsableObject(input) || !applyDefault(input, spec.segments, spec.default)) {
+      if (!isUsableObject(input) || !applyDefault(input, spec.segments, spec.default, undo)) {
         return error('type');
       }
       return null;
@@ -884,15 +897,25 @@ function processFormField(spec, input, nodeId) {
 }
 
 function processForm(node, input, compiled) {
-  const snapshot = structuredClone(input);
+  const undo = [];
   const errors = [];
   for (const spec of compiled) {
-    const fieldError = processFormField(spec, input, node.id);
+    const fieldError = processFormField(spec, input, node.id, undo);
     if (fieldError) errors.push(fieldError);
   }
-  return errors.length === 0
-    ? { ok: true }
-    : { ok: false, errors, rollback: snapshot };
+  if (errors.length === 0) return { ok: true };
+  // Roll back only this form's own writes, newest first: each added leaf is
+  // deleted, and each parent object created solely for those leaves is
+  // removed with it. Everything that was already there — caller data,
+  // earlier successful forms' defaults (including own properties they added
+  // to a Date or any other host object, which a structuredClone snapshot
+  // would silently drop), and the input's shared/circular reference
+  // topology — stays exactly as it was.
+  for (let i = undo.length - 1; i >= 0; i -= 1) {
+    const [object, key] = undo[i];
+    delete object[key];
+  }
+  return { ok: false, errors };
 }
 
 // Wait before a retry. Timers are the only suspension point: no other node is
@@ -1564,7 +1587,6 @@ function applyRegularNode(node, state) {
     if (compiled) {
       const formResult = processForm(node, state.context.input, compiled);
       if (!formResult.ok) {
-        state.context.input = formResult.rollback;
         return { status: 'invalid_input', context: state.context, trace: state.trace, errors: formResult.errors };
       }
     }
