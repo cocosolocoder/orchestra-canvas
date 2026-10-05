@@ -474,6 +474,135 @@ The result carries the `context`, `trace`, `actionAttempts`, `compensationStatus
 - **Compensation after cancellation** follows the usual rules: successful actions that declared a compensation are undone in reverse success order with their success-moment snapshots and compensation retry configs, a failed compensation never stops earlier ones, and the result returns only after all of them finish. Further cancellation during compensation neither interrupts it nor causes duplicate calls, and successful outputs are never deleted. With nothing to compensate, `compensationStatus` is `not_needed`.
 - A run that already visited `end` but still has unfinished activated branches can still be cancelled. A cancellation that arrives only after the terminal state was determined — including while a failure's compensation is still running — never rewrites that result.
 
+### End-to-end example: cancelling while a business action is still running
+
+Cancellation is **not** an interrupt of the business call. If the signal fires while an operation is in flight, the engine waits for that call to finish, keeps its outcome, and only then stops scheduling and runs compensation. The script below is complete and runnable; it makes that ordering visible with two caller-controlled gates, so the cancel happens at an exact, reproducible moment — after the business action has started but before it has finished — with no external services involved.
+
+A trigger runs `reserve-stock`, a business action that declares the compensation `releaseStock`, followed by a normal message action `charge-card` and an `end` node. The caller cancels while `reserveStock` is still in flight, then lets it succeed with a structured result:
+
+```js
+import { executeWorkflowAsync } from './src/engine.js';
+
+const workflow = {
+  id: 'cancel-during-action',
+  entry: 'start',
+  nodes: [
+    { id: 'start', type: 'trigger', next: 'reserve-stock' },
+    {
+      id: 'reserve-stock',
+      type: 'action',
+      operation: 'reserveStock',
+      compensation: { operation: 'releaseStock' },
+      next: 'charge-card',
+    },
+    { id: 'charge-card', type: 'action', message: 'card charged', next: 'done' },
+    { id: 'done', type: 'end', result: 'order placed' },
+  ],
+};
+
+const input = { orderId: 'A-100', sku: 'book', quantity: 2 };
+
+// Two caller-controlled gates make the cancellation point exact: the
+// business action announces it has started, then stays in flight until
+// the caller releases it.
+let markStarted;
+const started = new Promise(resolve => { markStarted = resolve; });
+let releaseReservation;
+const reservationGate = new Promise(resolve => { releaseReservation = resolve; });
+
+const events = [];
+const controller = new AbortController();
+
+const operations = {
+  async reserveStock(input) {
+    events.push('reserveStock: started');
+    markStarted();
+    await reservationGate; // still in flight when the cancel arrives
+    events.push('reserveStock: succeeded');
+    return { reservationId: 'RSV-1', sku: input.sku, quantity: input.quantity };
+  },
+  async releaseStock(input, output, result, nodeId, attempt) {
+    events.push(`releaseStock: compensated ${nodeId} (attempt ${attempt})`);
+    return { released: result.reservationId };
+  },
+};
+
+const run = executeWorkflowAsync(workflow, input, operations, { signal: controller.signal });
+
+await started;                 // the business action is now in flight
+controller.abort();            // cancel while reserveStock has not finished
+events.push('cancel requested');
+releaseReservation();          // the in-flight action now succeeds
+
+const result = await run;
+events.push('workflow returned');
+console.log(events);
+console.log(result);
+```
+
+Save it as `cancel-during-action.mjs` in the project root and run it with Node 20:
+
+```bash
+node cancel-during-action.mjs
+```
+
+The recorded events show the actual order — the cancel is requested *while the action is running*, the action still completes, its compensation runs, and only then does the workflow return:
+
+```json
+[
+  "reserveStock: started",
+  "cancel requested",
+  "reserveStock: succeeded",
+  "releaseStock: compensated reserve-stock (attempt 1)",
+  "workflow returned"
+]
+```
+
+The run's result:
+
+```json
+{
+  "status": "cancelled",
+  "context": {
+    "input": { "orderId": "A-100", "sku": "book", "quantity": 2 },
+    "output": {
+      "reserve-stock": { "reservationId": "RSV-1", "sku": "book", "quantity": 2 }
+    }
+  },
+  "trace": [
+    { "nodeId": "start", "type": "trigger" },
+    { "nodeId": "reserve-stock", "type": "action" }
+  ],
+  "actionAttempts": [
+    { "nodeId": "reserve-stock", "attempt": 1, "ok": true, "error": null, "nextDelayMs": 0 }
+  ],
+  "compensationStatus": "completed",
+  "compensationAttempts": [
+    {
+      "nodeId": "reserve-stock",
+      "operation": "releaseStock",
+      "attempt": 1,
+      "ok": true,
+      "error": null,
+      "nextDelayMs": 0,
+      "result": { "released": "RSV-1" }
+    }
+  ]
+}
+```
+
+Reading the result:
+
+- `status` is `cancelled` and there is **no top-level `result`** — the `done` end node never executed, so its `"order placed"` result was never recorded. `charge-card` never ran either: the `trace` contains only the nodes that actually executed (`start` and `reserve-stock`), and the output has no `charge-card` entry.
+- The in-flight action was awaited, not interrupted. Its success is fully kept: `context.output["reserve-stock"]` holds the structured value it returned after the cancel was requested, and `actionAttempts` records that call as `{ attempt: 1, ok: true }`.
+- Because `reserve-stock` succeeded and declared a compensation, the engine compensated it before returning: `compensationStatus` is `completed`, and `compensationAttempts` holds one record whose `nodeId` is the **original business node** (`reserve-stock`), whose `operation` is the compensation name (`releaseStock`), and whose `attempt` starts at `1`. The record's `result` is the compensation's own cloned return value.
+- The compensation was called as `releaseStock(input, output, result, nodeId, attempt)` with independent copies: the run input as it was when `reserve-stock` succeeded, the outputs earlier nodes had saved by that moment (empty here, since `reserve-stock` was the first action), and the value `reserve-stock` returned — which is how `releaseStock` could read `result.reservationId`. Mutating any of those copies would not touch the run's records.
+- Compensation never deletes the success it undoes: `context.output["reserve-stock"]` still holds the reservation after `releaseStock` completed.
+
+#### If the in-flight action fails after the cancel
+
+The same wait-and-keep rule applies to a failure. Had `reserveStock` thrown (or returned a rejected Promise) after `controller.abort()`, the run would still return `status: "cancelled"` — not `action_failed`, even if that failure was the last allowed attempt. The failed attempt stays in `actionAttempts` with its error and `nextDelayMs: 0`, the action is **not** retried, no output is saved for it, and — because it never succeeded — it is not compensated. Only actions that *succeeded* before the cancellation are compensated.
+
 The synchronous `executeWorkflow`, the command-line demo and uncancelled runs behave exactly as before.
 
 
