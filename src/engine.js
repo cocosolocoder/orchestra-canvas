@@ -1287,6 +1287,235 @@ function cloneRunInput(input) {
   return copy.copy;
 }
 
+// Host values structuredClone rebuilds from internal slots rather than as an
+// ordinary property bag: Date, RegExp, ArrayBuffer and byte views, errors
+// and boxed primitives, plus Blob/File/CryptoKey-style leaves. Map and Set
+// are walked separately (their entries must keep the graph's reference
+// identities). A value that reaches a run input has already passed an
+// independentCopy at reception, so every object the input graph holds is
+// ordinary structured-clone content; this classification only tells the
+// paired walk which objects structuredClone does not reproduce
+// property-by-property — it mirrors the branches containsSharedMemory walks.
+function isHostCloneLeaf(value) {
+  if (nodeTypes.isDate(value) || nodeTypes.isRegExp(value)
+    || nodeTypes.isBoxedPrimitive(value)
+    || nodeTypes.isArrayBuffer(value) || nodeTypes.isSharedArrayBuffer(value)
+    || nodeTypes.isNativeError(value)) {
+    return true;
+  }
+  for (const constructor of HOST_LEAF_CONSTRUCTORS) {
+    if (isInstanceOfGuarded(value, constructor)) return true;
+  }
+  return false;
+}
+
+// Copies the live run input for delivery to a business attempt, a
+// compensation attempt, or a compensation snapshot captured at an action's
+// success moment.
+//
+// The run input starts as an ordinary structured clone (cloneRunInput), so
+// reception-time behavior is unchanged: own properties the caller attached
+// to a Date (or any other host leaf) were dropped there, along with
+// non-enumerable and symbol-keyed properties everywhere. During the run,
+// though, a successful form can attach a missing field to such an object:
+// request.createdAt is a Date and a default for request.createdAt.channel
+// lands as an own enumerable property on the Date, and a multi-level path
+// creates fresh plain parent objects on it. A further plain structuredClone
+// of that input would silently drop the property again (a Date clones only
+// its internal time), so the business action and compensation would read an
+// input that disagrees with context.input and with the conditions: defaults
+// the run had already successfully applied would vanish precisely from the
+// delivered copies.
+//
+// The copy is built in two stages. The whole graph goes through ONE
+// structuredClone first: every Date keeps its Date type and original time
+// value, RegExps keep their pattern, Errors their cause, byte views their
+// bytes, and every reference relationship the clone retains — cycles,
+// aliases, a buffer shared between a standalone field and a view's backing
+// store — is exactly what a direct structuredClone produces (a Date subclass
+// is normalized to a plain Date exactly as at input reception). A paired
+// walk of original and clone records an original-to-clone identity map along
+// every edge the clone kept. The second stage restores only the own
+// enumerable properties the clone discarded — which, given reception
+// fidelity, can only be content a successful form added afterwards (a
+// defaulted field on a Date/RegExp/DataView/... with the plain parent
+// objects a multi-level default created). A restored value that points back
+// at retained content reuses the identity map, so two input fields that
+// pointed at the same Date still point at one copied Date inside each copy.
+// Every produced object is fresh, so a business action or compensation
+// rewriting the received Date's time, a defaulted field or a form-created
+// parent can never reach the run input, the caller's input, another run or
+// the next retry — each delivery is a complete independent copy as of its
+// own capture moment.
+function cloneInputGraph(source) {
+  const clonedRoot = structuredClone(source);
+  // original object -> the object the single structuredClone produced for it
+  const paired = new Map();
+  // Exactly the [original, clone] pairs that own an enumerable property the
+  // clone discarded — host leaves, Map/Set, errors and byte views — which in
+  // a run input can only carry content a successful form attached. The
+  // common case (ordinary objects and arrays, no host-attached fields)
+  // leaves this empty, so the second stage costs nothing extra.
+  const restorePairs = [];
+
+  // Returns the own enumerable keys of original that the clone does not carry
+  // — precisely the properties structuredClone dropped at that position.
+  const droppedKeys = (original, clone) => {
+    let dropped = null;
+    for (const key of Object.keys(original)) {
+      if (!Object.hasOwn(clone, key)) {
+        (dropped ??= []).push(key);
+      }
+    }
+    return dropped;
+  };
+
+  // Pairs the own enumerable children a non-leaf container retains, key by
+  // key (arrays reach this through their enumerable non-index properties;
+  // their indexed slots are aligned positionally by `pair`). Keys absent
+  // from the clone are properties structuredClone discarded (they can only
+  // exist on host leaves) — the pair is queued for the second stage, which
+  // rebuilds those subtrees with materialize.
+  const pairKeys = (original, clone) => {
+    for (const key of Object.keys(original)) {
+      if (Object.hasOwn(clone, key)) pair(original[key], clone[key]);
+    }
+    if (droppedKeys(original, clone) !== null) restorePairs.push([original, clone]);
+  };
+
+  function pair(original, clone) {
+    if (original === null || typeof original !== 'object') return;
+    if (paired.has(original)) return;
+    paired.set(original, clone);
+
+    if (Array.isArray(original)) {
+      // Enumerable indices line up positionally (holes stay holes);
+      // enumerable non-index properties align by key.
+      original.forEach((value, index) => pair(value, clone[index]));
+      pairKeys(original, clone);
+      return;
+    }
+    if (nodeTypes.isMap(original)) {
+      // Map iteration/insertion order survives the clone, so entries pair
+      // positionally — including object keys.
+      const originalEntries = [...original.entries()];
+      const clonedEntries = [...clone.entries()];
+      originalEntries.forEach(([key, value], index) => {
+        pair(key, clonedEntries[index][0]);
+        pair(value, clonedEntries[index][1]);
+      });
+      pairKeys(original, clone);
+      return;
+    }
+    if (nodeTypes.isSet(original)) {
+      const originalMembers = [...original];
+      const clonedMembers = [...clone];
+      originalMembers.forEach((value, index) => pair(value, clonedMembers[index]));
+      pairKeys(original, clone);
+      return;
+    }
+    if (nodeTypes.isNativeError(original)) {
+      // "cause" is the only Error own property structuredClone retains; it
+      // may be non-enumerable, so pair it explicitly rather than via keys.
+      let hasCause = false;
+      try { hasCause = Object.hasOwn(original, 'cause'); } catch { hasCause = false; }
+      if (hasCause) pair(original.cause, clone.cause);
+      pairKeys(original, clone);
+      return;
+    }
+    if (nodeTypes.isTypedArray(original) || nodeTypes.isDataView(original)) {
+      // The clone copied the bytes and built its own backing buffer; link
+      // the original buffer to that cloned buffer so a standalone field
+      // aliasing the same buffer resolves to the one shared copy. Indexed
+      // keys enumerate on a typed array but survive as cloned bytes, so only
+      // a genuine non-index expando (a field a form attached to the view)
+      // shows up as dropped and is queued for restoration.
+      pair(TYPED_ARRAY_BUFFER_GETTER.call(original),
+        nodeTypes.isDataView(original)
+          ? DATAVIEW_BUFFER_GETTER.call(clone)
+          : TYPED_ARRAY_BUFFER_GETTER.call(clone));
+      if (droppedKeys(original, clone) !== null) restorePairs.push([original, clone]);
+      return;
+    }
+    // Date, RegExp, ArrayBuffer, boxed primitives, DOMException/Blob/
+    // CryptoKey leaves, plain objects and arbitrary class instances:
+    // retained own enumerable string-keyed properties pair key-for-key;
+    // dropped ones (the properties a host leaf cannot carry through a
+    // clone) are restored in the second stage.
+    pairKeys(original, clone);
+  }
+
+  pair(source, clonedRoot);
+
+  // Creates a copy of a value the structured clone never reached — a subtree
+  // hanging solely off a dropped own property (the plain parents a
+  // multi-level form default created on a host leaf). References back into
+  // retained content resolve through `paired`; fresh content is rebuilt
+  // recursively and registered as it is created, so cycles inside the
+  // form-added subtree resolve to the new objects as well.
+  const materialize = value => {
+    if (value === null || typeof value !== 'object') return value;
+    if (paired.has(value)) return paired.get(value);
+
+    if (Array.isArray(value)) {
+      const array = new Array(value.length);
+      paired.set(value, array);
+      value.forEach((child, index) => { array[index] = materialize(child); });
+      copyDroppedKeys(value, array);
+      return array;
+    }
+    if (nodeTypes.isMap(value)) {
+      const map = new Map();
+      paired.set(value, map);
+      for (const [key, child] of value) map.set(materialize(key), materialize(child));
+      copyDroppedKeys(value, map);
+      return map;
+    }
+    if (nodeTypes.isSet(value)) {
+      const set = new Set();
+      paired.set(value, set);
+      for (const child of value) set.add(materialize(child));
+      copyDroppedKeys(value, set);
+      return set;
+    }
+    if (isHostCloneLeaf(value)
+      || nodeTypes.isTypedArray(value) || nodeTypes.isDataView(value)) {
+      // A host value or byte view inside form-created content is defensive
+      // only: form defaults are primitives and created parents are plain
+      // objects. structuredClone reproduces its internal state; any own
+      // properties it carried are restored below.
+      const leaf = structuredClone(value);
+      paired.set(value, leaf);
+      copyDroppedKeys(value, leaf);
+      return leaf;
+    }
+    const object = {};
+    paired.set(value, object);
+    copyDroppedKeys(value, object);
+    return object;
+  };
+
+  // Second stage: re-attach every dropped property only on the pairs that
+  // have one (host leaves / containers / byte views with a form-attached
+  // field). For a typed array the enumerable indexed keys survived as
+  // cloned bytes (hasOwn on the clone is true), so droppedKeys there only
+  // contains genuine non-index expandos; a DataView has no enumerable
+  // indexed own keys. Subtrees hanging off a restored property are rebuilt
+  // recursively; they are new plain content and carry all their keys.
+  function copyDroppedKeys(original, clone, keys = null) {
+    for (const key of keys ?? Object.keys(original)) {
+      if (!Object.hasOwn(clone, key)) clone[key] = materialize(original[key]);
+    }
+  }
+
+  for (const [original, clone] of restorePairs) {
+    copyDroppedKeys(original, clone, droppedKeys(original, clone));
+  }
+
+  return clonedRoot;
+}
+
+
 // Runs an operation under a retry policy — the one attempt loop shared by
 // business actions and compensations. Every invocation works on fresh
 // structured-clone argument copies produced by prepareArgs, so mutations by
@@ -1387,16 +1616,18 @@ async function runWithRetries({
   return { ok: false, error: lastReason };
 }
 
-// Runs one business action with retries. Every invocation receives fresh
-// structured clones of the current input and the successful outputs so far;
-// the stored success value is a clone independent of any object the
-// implementation keeps holding. The cancellation signal applies to this
-// loop only — compensation runs without one.
+// Runs one business action with retries. Every invocation receives a fresh
+// independent copy of the current input (cloneInputGraph — which, unlike a
+// plain structuredClone, keeps the fields successful forms attached to Date
+// and other host values) and a fresh structured clone of the successful
+// outputs so far; the stored success value is a clone independent of any
+// object the implementation keeps holding. The cancellation signal applies
+// to this loop only — compensation runs without one.
 async function runBusinessAction(node, binding, implementation, context, actionAttempts, signal) {
   return runWithRetries({
     retry: binding.retry,
     signal,
-    prepareArgs: attempt => [structuredClone(context.input), structuredClone(context.output), node.id, attempt],
+    prepareArgs: attempt => [cloneInputGraph(context.input), structuredClone(context.output), node.id, attempt],
     invoke: implementation,
     createRecord: attempt => ({ nodeId: node.id, attempt, ok: false, error: null, nextDelayMs: 0 }),
     copyFailureMessages: {
@@ -1409,16 +1640,19 @@ async function runBusinessAction(node, binding, implementation, context, actionA
 }
 
 // Runs compensation for one already-succeeded business action. The call gets
-// independent structured clones of the input and earlier outputs captured at
-// the original action's success moment, the stored return value, the node id
-// and a 1-based compensation attempt number. Nothing here can touch the run
-// context, a later attempt, another run, or the stored success output.
+// independent copies of the input and earlier outputs captured at the
+// original action's success moment (the input via cloneInputGraph, so
+// defaults earlier forms had attached to host values survive the frozen
+// snapshot while later forms' additions never enter it), the stored return
+// value, the node id and a 1-based compensation attempt number. Nothing here
+// can touch the run context, a later attempt, another run, or the stored
+// success output.
 async function runCompensation(entry, implementation, records) {
   const { nodeId, binding, snapshot } = entry;
   return runWithRetries({
     retry: binding.compensation.retry,
     prepareArgs: attempt => [
-      structuredClone(snapshot.input), structuredClone(snapshot.output),
+      cloneInputGraph(snapshot.input), structuredClone(snapshot.output),
       structuredClone(snapshot.result), nodeId, attempt,
     ],
     invoke: implementation,
@@ -1763,9 +1997,14 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
         }
         // Capture the compensation snapshots from the state before the new
         // output key lands: the action's own return value is handed to the
-        // compensation separately as its third argument.
+        // compensation separately as its third argument. The input snapshot
+        // goes through cloneInputGraph rather than a plain structuredClone,
+        // so defaults earlier successful forms attached to host values (a
+        // field on a Date, including freshly created parent paths) are
+        // frozen into the snapshot the same way context.input carries them;
+        // later forms' additions never enter this copy.
         const compensationSnapshot = binding.compensation === null ? null : {
-          input: structuredClone(state.context.input),
+          input: cloneInputGraph(state.context.input),
           output: structuredClone(state.context.output),
           result: structuredClone(actionResult.value),
         };
