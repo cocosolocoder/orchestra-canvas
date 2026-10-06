@@ -869,6 +869,28 @@ function runCondition(compiled, input, output, nodeId, position = '$') {
   };
 }
 
+// CanonicalNumericIndexString (ECMAScript): a property key a typed array
+// routes to its fixed element slots instead of treating it as an ordinary own
+// property. Assigning such an index that names no in-range element — past the
+// view's length, negative ("-1"), fractional ("1.5"), "-0", NaN or ±Infinity
+// — silently does nothing: neither the element nor an own expando property is
+// created. Non-canonical numeric spellings ("2.0", "00", "1e3") and ordinary
+// names ("tag") are not element keys and remain plain addable expando keys.
+function isCanonicalNumericIndexKey(part) {
+  if (part === '-0') return true;
+  return String(Number(part)) === part;
+}
+
+// True when a missing own property `part` cannot be created on `host`. Only a
+// typed array has such keys: a canonical numeric index outside its elements is
+// swallowed by the element machinery (see isCanonicalNumericIndexKey), whereas
+// plain objects, regular arrays and other host objects always accept a new own
+// property. An in-range typed-array element is always an existing own property
+// and therefore never reaches this (missing-key) path.
+function missingKeyIsUncreatable(host, part) {
+  return nodeTypes.isTypedArray(host) && isCanonicalNumericIndexKey(part);
+}
+
 // Applies one field default, recording every write in `undo` as [object, key]
 // pairs — one per parent object created along the path, then the leaf itself —
 // so a failed form can remove exactly its own additions afterwards. A default
@@ -888,6 +910,11 @@ function applyDefault(root, segments, value, undo) {
       if (!isUsableObject(next)) return false;
       current = next;
     } else {
+      // A typed array element index past its length (e.g. samples.2 on a
+      // two-element view, or a path that would descend through such an
+      // index) cannot be created: the assignment would silently no-op and
+      // the default would be reported as a success it never was.
+      if (missingKeyIsUncreatable(current, part)) return false;
       const created = {};
       current[part] = created;
       undo.push([current, part]);
@@ -895,6 +922,7 @@ function applyDefault(root, segments, value, undo) {
     }
   }
   const leaf = segments[segments.length - 1];
+  if (missingKeyIsUncreatable(current, leaf)) return false;
   current[leaf] = value;
   undo.push([current, leaf]);
   return true;
