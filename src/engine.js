@@ -893,6 +893,31 @@ function isUnwritableTypedArrayIndex(object, segment) {
     && !Object.hasOwn(object, segment);
 }
 
+// Defines `key` as a fresh own enumerable writable data property on `object`.
+// A form default only ever ADDS an own property, so this uses
+// [[DefineOwnProperty]] rather than [[Set]] on purpose: an assignment walks
+// the prototype chain and throws (the engine modules are strict) when the
+// inherited property is a read-only accessor or a non-writable data property —
+// Map/Set, typed arrays, WeakMap/WeakSet and others all carry an inherited
+// read-only `size` (or `length`) accessor, so a default for an absent
+// `options.size` used to abort the run with a TypeError instead of filling the
+// missing own field. Defining the own property shadows such an inherited
+// member for form and condition reads (which are own-only) without touching
+// the prototype or invoking any inherited setter. Returns false instead of
+// throwing when the property cannot be defined — a non-extensible target
+// (frozen/sealed input) or a proxy trap that rejects — so the caller reports
+// an ordinary type error.
+function defineDefaultProperty(object, key, value) {
+  try {
+    Object.defineProperty(object, key, {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Applies one field default, recording every write in `undo` as [object, key]
 // pairs — one per parent object created along the path, then the leaf itself —
 // so a failed form can remove exactly its own additions afterwards. A default
@@ -900,9 +925,18 @@ function isUnwritableTypedArrayIndex(object, segment) {
 // are created as fresh objects), so deleting those keys in reverse order
 // restores the input to precisely its pre-form state: values and objects that
 // predate the form — including own properties an earlier successful form
-// added, on plain objects and on host objects such as a Date — are never
-// touched, and the existing reference graph (shared or circular references)
-// is kept as-is rather than replaced by a clone.
+// added, on plain objects and on host objects such as a Date or a Map — are
+// never touched, and the existing reference graph (shared or circular
+// references) is kept as-is rather than replaced by a clone.
+//
+// Every existence test is own-only (Object.hasOwn): an inherited member — for
+// example Map.prototype.size, which reports the entry count — never counts as
+// a filled field and never blocks or redirects a default. In particular a
+// missing own PARENT is always created as a fresh plain object even when a
+// same-named member exists on the prototype, so a deeper path
+// (`options.size.label`) neither descends into the inherited primitive (the
+// numeric size) nor faults trying to extend it; the fresh parent and the leaf
+// land as own properties.
 function applyDefault(root, segments, value, undo) {
   let current = root;
   for (let i = 0; i < segments.length - 1; i += 1) {
@@ -913,10 +947,11 @@ function applyDefault(root, segments, value, undo) {
       current = next;
     } else {
       // Never create a parent at an out-of-bounds typed-array index: the
-      // assignment would vanish and the fresh object would be orphaned.
+      // fixed-length exotic object rejects the definition and the fresh
+      // object would be orphaned.
       if (isUnwritableTypedArrayIndex(current, part)) return false;
       const created = {};
-      current[part] = created;
+      if (!defineDefaultProperty(current, part, created)) return false;
       undo.push([current, part]);
       current = created;
     }
@@ -924,9 +959,9 @@ function applyDefault(root, segments, value, undo) {
   const leaf = segments[segments.length - 1];
   // The leaf is missing (the caller only runs when the full path is absent),
   // so on a typed array a canonical numeric leaf is always out of bounds and
-  // the write would be silently dropped.
+  // the property cannot be defined.
   if (isUnwritableTypedArrayIndex(current, leaf)) return false;
-  current[leaf] = value;
+  if (!defineDefaultProperty(current, leaf, value)) return false;
   undo.push([current, leaf]);
   return true;
 }
