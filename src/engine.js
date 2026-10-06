@@ -317,7 +317,6 @@ function compileCondition(condition, nodes, nodeId, position = '$', depth = 1) {
 
 const successorTargets = new WeakMap();
 const nodeDependencies = new WeakMap();
-const actionBindings = new WeakMap();
 
 const RETRY_FIELDS = ['attempts', 'initialDelayMs', 'backoffFactor', 'maxDelayMs'];
 const DEFAULT_RETRY = { attempts: 1, initialDelayMs: 0, backoffFactor: 1, maxDelayMs: 0 };
@@ -685,15 +684,18 @@ function detectCycles(nodes) {
 }
 
 // Internal compile pass: validates the whole definition and returns the node
-// table together with the per-form rules and per-condition trees compiled by
-// THIS pass. The two maps are fresh per validation and keyed by the node
-// objects of this definition — they deliberately are not shared in
-// module-level, node-keyed storage, so a later validateWorkflow (or execution
-// entry) against the same node objects can never overwrite the form rules or
-// the condition expression an earlier, still-running run accepted. Each
-// execution captures both maps at its own start, before the first suspension,
-// and every form and condition in that run keeps using exactly the rules and
-// tree captured then.
+// table together with the per-form rules, per-condition trees and per-action
+// business bindings compiled by THIS pass. The three maps are fresh per
+// validation and keyed by the node objects of this definition — they
+// deliberately are not shared in module-level, node-keyed storage, so a later
+// validateWorkflow (or execution entry) against the same node objects can
+// never overwrite the form rules, the condition expression or the business
+// action configuration an earlier, still-running run accepted. Each execution
+// captures all three maps at its own start, before the first suspension, and
+// every form, condition and business action in that run keeps using exactly
+// the rules, tree and binding captured then — including the action's
+// operation name, retry settings, and whether it compensates with which
+// compensation operation and retry settings.
 function compileWorkflow(workflow) {
   assertPlainObject(workflow, 'workflow');
   if (typeof workflow.id !== 'string' || !workflow.id.trim()) throw new Error('workflow.id is required');
@@ -713,10 +715,13 @@ function compileWorkflow(workflow) {
   // Owned by this validation only; a form with no schema maps to null so the
   // execution loop can distinguish "compiled, no schema" without re-reading
   // the live node. The condition map holds the whole compiled condition tree
-  // of every condition node this pass accepted; both maps are captured by the
-  // run that starts through this pass and never shared with a later one.
+  // of every condition node this pass accepted; the action map holds the
+  // compiled business binding (operation name, retry, compensation) of every
+  // action node this pass accepted. All three maps are captured by the run
+  // that starts through this pass and never shared with a later one.
   const formRules = new Map();
   const conditionRules = new Map();
+  const actionBindings = new Map();
 
   let requiresSingleEnd = false;
   for (const node of nodes.values()) {
@@ -750,7 +755,7 @@ function compileWorkflow(workflow) {
   }
 
   detectCycles(nodes);
-  return { nodes, formRules, conditionRules };
+  return { nodes, formRules, conditionRules, actionBindings };
 }
 
 export function validateWorkflow(workflow) {
@@ -1654,21 +1659,28 @@ async function compensateRun(state, operations) {
 // and operation-registration checks but (for the asynchronous entry) before
 // the already-aborted-at-start short-circuit, so a shared-memory input is
 // rejected with a TypeError even when the signal has already fired.
-// `formRules` and `conditionRules` are the per-form compiled-rules map and the
-// per-condition compiled-tree map produced by the validation pass THIS run
-// started through. They are captured here — before the first suspension point
-// — as part of the run state, so a form or condition that executes only after
-// a business-operation wait keeps using exactly the rules and expression that
-// start-time validation accepted. A later validateWorkflow or a new run over
-// the same node objects builds its own maps and cannot reach these. The
-// compiled form entries hold only primitives (field types restrict defaults
-// to primitives) and freshly built segment arrays; the compiled condition
-// trees hold only primitives, pre-resolved output-reference node ids and
-// freshly built segment arrays — so both snapshots are already independent of
-// the caller's definition. The branch destinations (then/else/next) and
-// dependency lists are deliberately not snapshotted here: only the condition
-// *expression* is pinned to the run's start, matching the form-rules rule.
-function createRunState(nodes, workflow, input, formRules, conditionRules) {
+// `formRules`, `conditionRules` and `actionBindings` are the per-form
+// compiled-rules map, the per-condition compiled-tree map and the per-action
+// compiled-binding map produced by the validation pass THIS run started
+// through. They are captured here — before the first suspension point — as
+// part of the run state, so a form, condition or business action that
+// executes only after a business-operation wait keeps using exactly the
+// rules, expression and action configuration that start-time validation
+// accepted: the operation actually invoked, its attempt count and waits, and
+// whether a compensation runs under which name and retry settings. A later
+// validateWorkflow or a new run over the same node objects builds its own
+// maps and cannot reach these — even one that fails partway through, since a
+// rejected pass never publishes its maps at all. The compiled form entries
+// hold only primitives (field types restrict defaults to primitives) and
+// freshly built segment arrays; the compiled condition trees hold only
+// primitives, pre-resolved output-reference node ids and freshly built
+// segment arrays; the compiled bindings hold only the operation name strings
+// and fresh retry/compensation objects compileAction built — so all three
+// snapshots are already independent of the caller's definition. The branch
+// destinations (then/else/next) and dependency lists are deliberately not
+// snapshotted here: only the condition *expression* and the action
+// configuration are pinned to the run's start, matching the form-rules rule.
+function createRunState(nodes, workflow, input, formRules, conditionRules, actionBindings) {
   const declarationOrder = [...nodes.values()];
   const declarationIndex = new Map(declarationOrder.map((node, index) => [node.id, index]));
   return {
@@ -1677,6 +1689,7 @@ function createRunState(nodes, workflow, input, formRules, conditionRules) {
     context: { input: cloneRunInput(input), output: {} },
     formRules,
     conditionRules,
+    actionBindings,
     declarationOrder,
     declarationIndex,
     activated: new Set([workflow.entry]),
@@ -1834,7 +1847,7 @@ function resolveImplementation(operations, name, nodeId, kind) {
   return operations[name];
 }
 
-function verifyOperations(nodes, operations) {
+function verifyOperations(nodes, operations, actionBindings) {
   for (const node of nodes.values()) {
     const binding = actionBindings.get(node);
     if (binding && binding.name !== null) {
@@ -1862,7 +1875,7 @@ function resolveRunSignal(options) {
 }
 
 export function executeWorkflow(workflow, input = {}) {
-  const { nodes, formRules, conditionRules } = compileWorkflow(workflow);
+  const { nodes, formRules, conditionRules, actionBindings } = compileWorkflow(workflow);
   // Business operations are asynchronous: the synchronous entry must refuse
   // a workflow that names any before a single node executes.
   for (const node of nodes.values()) {
@@ -1872,7 +1885,7 @@ export function executeWorkflow(workflow, input = {}) {
     }
   }
 
-  const state = createRunState(nodes, workflow, input, formRules, conditionRules);
+  const state = createRunState(nodes, workflow, input, formRules, conditionRules, actionBindings);
 
   for (;;) {
     const step = advanceSchedule(state);
@@ -1915,10 +1928,10 @@ function cancelledResult(state) {
 
 export async function executeWorkflowAsync(workflow, input = {}, operations = {}, options = undefined) {
   const signal = resolveRunSignal(options);
-  const { nodes, formRules, conditionRules } = compileWorkflow(workflow);
-  verifyOperations(nodes, operations);
+  const { nodes, formRules, conditionRules, actionBindings } = compileWorkflow(workflow);
+  verifyOperations(nodes, operations, actionBindings);
 
-  const state = createRunState(nodes, workflow, input, formRules, conditionRules);
+  const state = createRunState(nodes, workflow, input, formRules, conditionRules, actionBindings);
 
   // A signal that is already aborted stops the run before the first node —
   // but only after the definition and the operation registrations above have
@@ -1957,7 +1970,12 @@ export async function executeWorkflowAsync(workflow, input = {}, operations = {}
 
     const ready = step.node;
     if (ready.type === 'action') {
-      const binding = actionBindings.get(ready);
+      // The binding this run captured at its own start: a revalidation of the
+      // same node object while this run was parked compiled a fresh binding
+      // into a different map and cannot reach this one, so the operation
+      // invoked, the retry budget and the compensation configuration are
+      // exactly the ones this run's start-time validation accepted.
+      const binding = state.actionBindings.get(ready);
       if (binding.name !== null) {
         // Nodes execute one at a time in declaration order; awaiting here
         // never lets another node jump ahead.
