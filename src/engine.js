@@ -1341,6 +1341,16 @@ function cloneRunInput(input) {
 //  - a reattached subtree is itself structured-cloned, so an action or
 //    compensation editing a default, a created parent or the Date itself
 //    cannot reach the run input, the caller's input or any other copy.
+//
+// One reachability gap the enumerable-key walk cannot cover on its own: a
+// native Error's own "cause" survives the clone (message/name/stack are
+// copied as primitives; every other own property is dropped) but is
+// non-enumerable on both the source and the clone, so Object.keys never
+// visits it and a Date reachable only through one or more causes would lose
+// its run-time defaults here. Mirroring the native-error branch of
+// containsSharedMemory, the walk pairs source and clone causes explicitly —
+// a cause chain (Error -> cause -> Error -> cause -> Date) is followed link
+// by link exactly like any other path.
 function copyInputWithFormDefaults(input) {
   const clone = structuredClone(input);
   const processed = new Set();
@@ -1402,6 +1412,58 @@ function copyInputWithFormDefaults(input) {
       }
       if (isTraversable(sourceValue) && isTraversable(targetValue)) {
         stack.push([sourceValue, targetValue]);
+      }
+    }
+
+    // A native Error's own "cause" is cloned (even though non-enumerable),
+    // so the key walk above never paired it. Pair the two causes now — the
+    // same judgment containsSharedMemory makes for the clone it judges — so
+    // form defaults attached anywhere under failure.cause (a Date reached
+    // only through causes, possibly via plain objects or further Error links)
+    // are reattached on the clone's cause exactly like anywhere else. A
+    // cause the source carries as an enumerable own property was already
+    // paired by the key walk; the processed set absorbs the duplicate.
+    if (nodeTypes.isNativeError(source)) {
+      let sourceHasCause;
+      try {
+        sourceHasCause = Object.hasOwn(source, 'cause');
+      } catch {
+        sourceHasCause = false;
+      }
+      if (sourceHasCause) {
+        let sourceCause;
+        try {
+          sourceCause = source.cause;
+        } catch {
+          sourceCause = undefined;
+        }
+        let targetHasCause;
+        try {
+          targetHasCause = Object.hasOwn(target, 'cause');
+        } catch {
+          targetHasCause = false;
+        }
+        if (!targetHasCause) {
+          // The clone dropped the cause itself (not expected for a genuine
+          // Error clone, which always carries it): reattach an independent
+          // copy with the non-enumerable shape a cloned cause has.
+          if (sourceCause !== undefined) {
+            Object.defineProperty(target, 'cause', {
+              value: structuredClone(sourceCause),
+              writable: true, enumerable: false, configurable: true,
+            });
+          }
+        } else {
+          let targetCause;
+          try {
+            targetCause = target.cause;
+          } catch {
+            targetCause = undefined;
+          }
+          if (isTraversable(sourceCause) && isTraversable(targetCause)) {
+            stack.push([sourceCause, targetCause]);
+          }
+        }
       }
     }
   }
