@@ -1064,6 +1064,23 @@ function isInstanceOfGuarded(value, constructor) {
   }
 }
 
+// Whether structuredClone serializes this node as a native Error whose own
+// "cause" survives the clone. util.types brands genuine native errors across
+// realms (Error, TypeError, AggregateError, …), but DOMException also brands
+// as one while being serialized as a host leaf — its "cause" is never copied —
+// so the host-leaf constructors (DOMException first of all) must be excluded,
+// exactly as they precede the native-error branch in containsSharedMemory.
+// An AggregateError's "errors" array is never cloned either; only "cause"
+// ever crosses an Error clone. Note the "cause" the Error constructor
+// installs is a NON-enumerable own property.
+function isClonedCauseError(value) {
+  if (!nodeTypes.isNativeError(value)) return false;
+  for (const constructor of HOST_LEAF_CONSTRUCTORS) {
+    if (isInstanceOfGuarded(value, constructor)) return false;
+  }
+  return true;
+}
+
 // Array.isArray performs a proxy-revocation check (IsArray) and throws on a
 // revoked proxy, unlike the internal-slot brand checks. A throw means the
 // value cannot be classified as an array here; the Object.keys step below is
@@ -1198,7 +1215,7 @@ function containsSharedMemory(value) {
       }
       continue;
     }
-    if (nodeTypes.isNativeError(current)) {
+    if (isClonedCauseError(current)) {
       // Only "cause" survives an Error clone (message/name/stack are copied
       // as primitives; other own properties are dropped), so it alone needs
       // traversal — including when it is non-enumerable.
@@ -1334,6 +1351,12 @@ function cloneRunInput(input) {
 //  - the Date keeps its original type and time value, the default merely
 //    joins it as an own property;
 //  - the whole multi-level path a default created is reattached together;
+//  - the walk pairs a native Error's own "cause" even though it is
+//    non-enumerable (it is the one non-enumerable edge structuredClone
+//    preserves), so a Date reached directly, through a plain object, or
+//    through another layer of Error — including one reached only via cause —
+//    is paired like any other node; DOMException's cause is not cloned and
+//    stays unpaired;
 //  - identity the clone preserved is kept — when two input fields point at
 //    one Date, both still point at the single reattached clone node inside
 //    this copy (each invocation gets its own copy, so retries and the live
@@ -1347,11 +1370,13 @@ function copyInputWithFormDefaults(input) {
   // Pairs of [live node, its clone counterpart]. The lockstep walk follows
   // enumerable own properties — the same protocol forms and lookupOwn
   // navigate by — on plain objects, host objects and arrays alike, mirroring
-  // the clone graph node for node. (Form paths may not cross an array
-  // intermediate — such a default is a type error — but descending into
-  // arrays anyway keeps the pairing total and harmless.) The internal entries
-  // of Map/Set and the slots of byte views are unreachable by own-property
-  // paths and need no pairing.
+  // the clone graph node for node. It additionally pairs a native Error's
+  // non-enumerable own "cause", the one non-enumerable edge structuredClone
+  // preserves (handled in the per-node step below). (Form paths may not cross
+  // an array intermediate — such a default is a type error — but descending
+  // into arrays anyway keeps the pairing total and harmless.) The internal
+  // entries of Map/Set and the slots of byte views are unreachable by
+  // own-property paths and need no pairing.
   const stack = [[input, clone]];
   const isTraversable = value => value !== null && typeof value === 'object';
   while (stack.length > 0) {
@@ -1364,6 +1389,35 @@ function copyInputWithFormDefaults(input) {
       keys = Object.keys(source);
     } catch {
       continue;
+    }
+    // A native Error's own "cause" survives structuredClone even though the
+    // Error constructor installs it as a NON-enumerable own property, so it
+    // is absent from Object.keys above. Pair that edge explicitly — the same
+    // edge containsSharedMemory traverses — otherwise the walk could never
+    // follow input.failure.cause… and a default a form attached to a Date
+    // reached only through it would be missing from every action and
+    // compensation copy. The edge is added only when the clone carries its
+    // own counterpart, so a "cause" structuredClone itself drops (e.g. an
+    // accessor cause) is never reattached here; only the run-time form
+    // reattachment below may add properties. DOMException is excluded: its
+    // cause is not cloned. An enumerable cause was already listed in `keys`.
+    if (isClonedCauseError(source)) {
+      let descriptor;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(source, 'cause');
+      } catch {
+        descriptor = undefined;
+      }
+      let targetHasCause = false;
+      try {
+        targetHasCause = Object.hasOwn(target, 'cause');
+      } catch {
+        targetHasCause = false;
+      }
+      if (descriptor !== undefined && !descriptor.enumerable && !keys.includes('cause')
+        && targetHasCause) {
+        keys.push('cause');
+      }
     }
     for (const key of keys) {
       let sourceValue;
