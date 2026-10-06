@@ -869,6 +869,30 @@ function runCondition(compiled, input, output, nodeId, position = '$') {
   };
 }
 
+// A canonical numeric index string in the spec sense ("2", "0", "-0", but
+// not "02", "2.5" or " 2"): exactly the property names a typed array treats
+// as element indices rather than ordinary own properties.
+function isCanonicalNumericIndex(segment) {
+  if (segment === '-0') return true;
+  return String(Number(segment)) === segment;
+}
+
+// A typed array's element set is fixed at creation: every index below its
+// length already exists, and an out-of-bounds index can never be added —
+// assigning to one is silently ignored (the integer-indexed exotic [[Set]]
+// reports success without storing anything, even in strict mode). Letting
+// that no-op pass as a successful default write would report a field the
+// input does not actually carry, so a default whose path ends at — or merely
+// crosses — a missing typed-array index fails as a type error, exactly like
+// a path crossing a primitive. Ordinary property names on a typed array
+// (including numeric-looking strings that are not canonical indices, such as
+// "02" or "2.5") remain plain own properties a default can add, and existing
+// in-bounds indices keep the field's normal type and range checks.
+function isUnwritableTypedArrayIndex(object, segment) {
+  return nodeTypes.isTypedArray(object) && isCanonicalNumericIndex(segment)
+    && !Object.hasOwn(object, segment);
+}
+
 // Applies one field default, recording every write in `undo` as [object, key]
 // pairs — one per parent object created along the path, then the leaf itself —
 // so a failed form can remove exactly its own additions afterwards. A default
@@ -888,6 +912,9 @@ function applyDefault(root, segments, value, undo) {
       if (!isUsableObject(next)) return false;
       current = next;
     } else {
+      // Never create a parent at an out-of-bounds typed-array index: the
+      // assignment would vanish and the fresh object would be orphaned.
+      if (isUnwritableTypedArrayIndex(current, part)) return false;
       const created = {};
       current[part] = created;
       undo.push([current, part]);
@@ -895,6 +922,10 @@ function applyDefault(root, segments, value, undo) {
     }
   }
   const leaf = segments[segments.length - 1];
+  // The leaf is missing (the caller only runs when the full path is absent),
+  // so on a typed array a canonical numeric leaf is always out of bounds and
+  // the write would be silently dropped.
+  if (isUnwritableTypedArrayIndex(current, leaf)) return false;
   current[leaf] = value;
   undo.push([current, leaf]);
   return true;
