@@ -893,6 +893,24 @@ function isUnwritableTypedArrayIndex(object, segment) {
     && !Object.hasOwn(object, segment);
 }
 
+// Defines `key` as a fresh own enumerable data property holding `value` on
+// `object`, never assigning through the prototype chain. A structured input
+// may legitimately be a host object whose prototype already answers the same
+// name with an inherited member a default is allowed to shadow with an own
+// property — a Map's prototype, for example, carries "size" as an
+// accessor-only property: an own "size" is a perfectly legal field, but a
+// plain `object[key] = value` [[Set]] finds the inherited getter (with no
+// setter) and throws a TypeError instead of creating the own property the
+// field needs. Definition bypasses [[Set]] entirely and installs exactly the
+// own data property the missing-field semantics call for. The path compiler
+// already rejects "__proto__", so an inherited setter for that name can never
+// reach this either.
+function defineOwnField(object, key, value) {
+  Object.defineProperty(object, key, {
+    value, writable: true, enumerable: true, configurable: true,
+  });
+}
+
 // Applies one field default, recording every write in `undo` as [object, key]
 // pairs — one per parent object created along the path, then the leaf itself —
 // so a failed form can remove exactly its own additions afterwards. A default
@@ -903,6 +921,13 @@ function isUnwritableTypedArrayIndex(object, segment) {
 // added, on plain objects and on host objects such as a Date — are never
 // touched, and the existing reference graph (shared or circular references)
 // is kept as-is rather than replaced by a clone.
+//
+// Presence is judged with hasOwn at every step: a value inherited from the
+// prototype (Map.prototype.size and friends) neither fills a missing field
+// nor blocks a default. When an own parent is missing it is created even if
+// the prototype answers that name — the default never descends into the
+// inherited member — and the writes use defineOwnProperty so an inherited
+// read-only or accessor-only property cannot make the legal default throw.
 function applyDefault(root, segments, value, undo) {
   let current = root;
   for (let i = 0; i < segments.length - 1; i += 1) {
@@ -913,10 +938,10 @@ function applyDefault(root, segments, value, undo) {
       current = next;
     } else {
       // Never create a parent at an out-of-bounds typed-array index: the
-      // assignment would vanish and the fresh object would be orphaned.
+      // definition would be ignored and the fresh object would be orphaned.
       if (isUnwritableTypedArrayIndex(current, part)) return false;
       const created = {};
-      current[part] = created;
+      defineOwnField(current, part, created);
       undo.push([current, part]);
       current = created;
     }
@@ -926,7 +951,7 @@ function applyDefault(root, segments, value, undo) {
   // so on a typed array a canonical numeric leaf is always out of bounds and
   // the write would be silently dropped.
   if (isUnwritableTypedArrayIndex(current, leaf)) return false;
-  current[leaf] = value;
+  defineOwnField(current, leaf, value);
   undo.push([current, leaf]);
   return true;
 }
