@@ -315,11 +315,30 @@ function compileCondition(condition, nodes, nodeId, position = '$', depth = 1) {
   return { kind: 'comparison', operator: condition.operator, left, right };
 }
 
-const formSchemas = new WeakMap();
+// Form rules are accepted by a single validation pass and pinned to that
+// pass alone. Each validateWorkflow call builds a fresh nodes Map; the
+// compiled form schemas it accepted are keyed by that Map (see
+// compileFormSchemasForValidation), and a run created from the returned Map
+// keeps using it for the run's whole life. Editing a node's schema and
+// validating again — or starting another run — creates another entry under a
+// new Map, so it can never overwrite the rules a still-suspended earlier run
+// is waiting on; a validation that throws publishes nothing.
+const validationFormSchemas = new WeakMap();
 const compiledConditions = new WeakMap();
 const successorTargets = new WeakMap();
 const nodeDependencies = new WeakMap();
 const actionBindings = new WeakMap();
+
+// Compiles every form node's schema for one validation pass into a single
+// Map keyed by the node object, so the pass's accepted rules stay together
+// and never touch another pass's entry in validationFormSchemas.
+function compileFormSchemasForValidation(nodes) {
+  const schemas = new Map();
+  for (const node of nodes.values()) {
+    if (node.type === 'form') schemas.set(node, compileFormSchema(node));
+  }
+  return schemas;
+}
 
 const RETRY_FIELDS = ['attempts', 'initialDelayMs', 'backoffFactor', 'maxDelayMs'];
 const DEFAULT_RETRY = { attempts: 1, initialDelayMs: 0, backoffFactor: 1, maxDelayMs: 0 };
@@ -712,9 +731,6 @@ export function validateWorkflow(workflow) {
     if (Object.hasOwn(node, 'compensation') && node.compensation !== undefined && node.type !== 'action') {
       throw new Error(`node ${node.id}: compensation is only allowed on a business action node`);
     }
-    if (node.type === 'form') {
-      formSchemas.set(node, compileFormSchema(node));
-    }
     if (node.type === 'condition') {
       compiledConditions.set(node, compileCondition(node.condition, nodes, node.id));
     }
@@ -734,6 +750,10 @@ export function validateWorkflow(workflow) {
   }
 
   detectCycles(nodes);
+  // Publish this pass's accepted form rules only after every definition
+  // check has succeeded; a later failed re-validation leaves the earlier
+  // pass's entry intact and publishes nothing.
+  validationFormSchemas.set(nodes, compileFormSchemasForValidation(nodes));
   return nodes;
 }
 
@@ -1579,6 +1599,11 @@ function createRunState(nodes, workflow, input) {
     trace: [],
     actionAttempts: [],
     context: { input: cloneRunInput(input), output: {} },
+    // The rules this run's start-time validation accepted, pinned for the
+    // run's whole life: a later validateWorkflow or another run over the same
+    // (possibly edited) definition cannot replace them while this run is
+    // suspended inside a business operation.
+    formSchemas: validationFormSchemas.get(nodes),
     declarationOrder,
     declarationIndex,
     activated: new Set([workflow.entry]),
@@ -1692,7 +1717,7 @@ function applyRegularNode(node, state) {
     );
   }
   if (node.type === 'form') {
-    const compiled = formSchemas.get(node);
+    const compiled = state.formSchemas.get(node);
     if (compiled) {
       const formResult = processForm(node, state.context.input, compiled);
       if (!formResult.ok) {
