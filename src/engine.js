@@ -1424,6 +1424,56 @@ function cloneRunInput(input) {
 // containsSharedMemory, the walk pairs source and clone causes explicitly —
 // a cause chain (Error -> cause -> Error -> cause -> Date) is followed link
 // by link exactly like any other path.
+//
+// A second Error-slot gap the key walk cannot repair on its own is "message".
+// structuredClone serializes an Error's message slot as a STRING: a live own
+// message holding an object (the object a successful form creates when a
+// default lands at failure.message.label), a number or a boolean (a form
+// default written directly at failure.message) is cloned as the coerced text
+// "[object Object]", "5" or "false" — and the clone even installs that text
+// as a fresh own property, so the clone never LACKS "message" the way it
+// lacks a non-string "name" (which the clone drops outright, letting the
+// ordinary dropped-key reattachment handle it). The form-written value and
+// its already-validated fields would therefore reach a business action as a
+// plain string. restoreErrorMessage repairs that one slot explicitly, in the
+// same standalone-clone manner the key walk reattaches any other subtree a
+// clone dropped: such a message subtree holds only form-created plain objects
+// and primitive defaults, so one structuredClone is its complete, independent
+// deep copy (there is no nested clone-special node the clone graph could
+// pair or alias through it).
+function restoreErrorMessage(source, target) {
+  // Only a live OWN data property that is not a string can be a form-written
+  // value: a form defines defaults as own enumerable data properties, and the
+  // field types it accepts are string/number/integer/boolean, so a repair is
+  // needed exactly for an own non-string. Everything else — an absent or
+  // deleted own message (the prototype's "" slot), an inherited message, an
+  // accessor (forms never install one; the clone reads it through its slot),
+  // and an ordinary string message — is left exactly as structuredClone
+  // produced it, so existing string messages keep their current behavior.
+  let descriptor;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(source, 'message');
+  } catch {
+    return;
+  }
+  if (!descriptor || !('value' in descriptor)) return;
+  const liveMessage = descriptor.value;
+  if (liveMessage === undefined || typeof liveMessage === 'string') return;
+
+  // Replace the clone's coerced text with an independent deep copy of the
+  // true form-written value. Form-created message subtrees hold only
+  // primitives and fresh plain objects, so this clone always succeeds; cloning
+  // here detaches the repaired slot from the live run input so an action
+  // rewriting the message, one of its fields or a created parent cannot reach
+  // the run input, the caller's Error or another attempt copy. Define an own
+  // enumerable data property (the shape the live own message has) rather than
+  // assigning, so no inherited accessor can intercept the repair.
+  Object.defineProperty(target, 'message', {
+    value: structuredClone(liveMessage),
+    writable: true, enumerable: true, configurable: true,
+  });
+}
+
 function copyInputWithFormDefaults(input) {
   const clone = structuredClone(input);
   const processed = new Set();
@@ -1497,6 +1547,12 @@ function copyInputWithFormDefaults(input) {
     // cause the source carries as an enumerable own property was already
     // paired by the key walk; the processed set absorbs the duplicate.
     if (nodeTypes.isNativeError(source)) {
+      // Repair the message slot: structuredClone turned any own non-string
+      // message (the object/number/boolean a successful form wrote) into an
+      // own coerced string the key walk above could neither reattach nor
+      // pair. This restores the true value as an independent copy.
+      restoreErrorMessage(source, target);
+
       let sourceHasCause;
       try {
         sourceHasCause = Object.hasOwn(source, 'cause');
