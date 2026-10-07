@@ -2144,7 +2144,20 @@ function applyRegularNode(node, state) {
     if (!outcome.ok) {
       return { status: 'invalid_condition', context: state.context, trace: state.trace, error: outcome.error };
     }
-    state.activated.add(outcome.value ? node.then : node.else);
+    // Branch destinations obey exactly the publication rule ordinary next
+    // successors do: the [then, else] pair normalized for this condition node
+    // is read from the shared successorTargets store — the relations of the
+    // most recent compile pass that RAN TO COMPLETION — never straight from
+    // the live node object. Reading node.then/node.else here would let an edit
+    // made while this run is parked on an earlier business operation reroute a
+    // condition the run has not evaluated yet even when no validation accepted
+    // it (or when validation failed on another node, on an untaken branch or
+    // only in the final cycle check). The two exits are one published pair, so
+    // they switch together: a rejected pass leaves both at the last accepted
+    // targets, a fully successful pass updates both for this run and for new
+    // ones. Only the selected exit activates; the unchosen one never does.
+    const branchTargets = successorTargets.get(node);
+    state.activated.add(outcome.value ? branchTargets[0] : branchTargets[1]);
   } else {
     for (const target of successorTargets.get(node)) state.activated.add(target);
   }
