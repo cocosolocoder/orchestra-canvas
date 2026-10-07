@@ -1425,8 +1425,9 @@ function cloneRunInput(input) {
 // a cause chain (Error -> cause -> Error -> cause -> Date) is followed link
 // by link exactly like any other path.
 //
-// A second Error-slot gap the key walk cannot repair on its own is "message".
-// structuredClone serializes an Error's message slot as a STRING: a live own
+// A second Error-slot gap the key walk cannot repair on its own is "message"
+// (and, by the same mechanism, "name"). structuredClone serializes an Error's
+// message slot through ABSTRACT STRING COERCION of the live value: a live own
 // message holding an object (the object a successful form creates when a
 // default lands at failure.message.label), a number or a boolean (a form
 // default written directly at failure.message) is cloned as the coerced text
@@ -1435,12 +1436,33 @@ function cloneRunInput(input) {
 // lacks a non-string "name" (which the clone drops outright, letting the
 // ordinary dropped-key reattachment handle it). The form-written value and
 // its already-validated fields would therefore reach a business action as a
-// plain string. restoreErrorMessage repairs that one slot explicitly, in the
-// same standalone-clone manner the key walk reattaches any other subtree a
-// clone dropped: such a message subtree holds only form-created plain objects
-// and primitive defaults, so one structuredClone is its complete, independent
-// deep copy (there is no nested clone-special node the clone graph could
-// pair or alias through it).
+// plain string.
+//
+// Coercion itself can also THROW. "toString" is an ordinary data field here,
+// exactly like "label": a string default written at failure.message.toString
+// leaves the message object with an own non-callable toString. When the
+// serializer asks that object to coerce itself to the message string, no
+// conversion path works (an own "toString" that is not a function is ignored
+// and the inherited valueOf yields a non-primitive), so the whole
+// structuredClone fails with "Cannot convert object to primitive value" —
+// before the business operation or compensation was ever entered, the async
+// run died while merely preparing its argument copy. The same crash reaches
+// "name" and every Error nested through enumerable properties or a cause
+// chain. copyInputWithFormDefaults therefore masks every own non-string
+// message/name data slot for the duration of that one clone (message with "",
+// which the serializer installs as the slot's own string; name with
+// undefined, which makes the serializer omit it) and restores the live slots
+// immediately after, so the clone skeleton is built — aliases, cycles, causes
+// and all — without ever coercing a form-written slot. restoreErrorMessage
+// then repairs the message slot exactly as before, in the same
+// standalone-clone manner the key walk reattaches any other subtree a clone
+// dropped: such a message subtree holds only form-created plain objects and
+// primitive defaults (an own non-callable "toString" being just one more
+// string field among them), so one structuredClone is its complete,
+// independent deep copy (there is no nested clone-special node the clone
+// graph could pair or alias through it). A masked non-string "name" is simply
+// absent on the fresh clone and is reattached by the ordinary dropped-key
+// walk below, with the same standalone-clone isolation.
 function restoreErrorMessage(source, target) {
   // Only a live OWN data property that is not a string can be a form-written
   // value: a form defines defaults as own enumerable data properties, and the
@@ -1450,6 +1472,9 @@ function restoreErrorMessage(source, target) {
   // accessor (forms never install one; the clone reads it through its slot),
   // and an ordinary string message — is left exactly as structuredClone
   // produced it, so existing string messages keep their current behavior.
+  // (The slot-masking pass guarantees the target currently carries only the
+  // mask "" whenever this branch is taken, regardless of how the live value
+  // would otherwise have coerced.)
   let descriptor;
   try {
     descriptor = Object.getOwnPropertyDescriptor(source, 'message');
@@ -1474,8 +1499,160 @@ function restoreErrorMessage(source, target) {
   });
 }
 
+// Temporarily replaces every own OBJECT-valued data "message"/"name" slot on
+// every Error the structured clone would otherwise serialize, and returns a
+// restore function that puts every original descriptor back verbatim. The
+// clone's Error serializer runs ABSTRACT ToString on those two slots; an
+// object carrying an own non-callable "toString" (an ordinary form-written
+// string field, no different from "label") makes that coercion throw and take
+// the whole clone down with it. Mask values are "" for message (the serializer
+// installs it as the clone's own string slot, which restoreErrorMessage then
+// replaces) and undefined for name (the serializer omits it, so the ordinary
+// dropped-key walk reattaches it). Only writable, configurable own data
+// properties holding an object are masked — the exact shape a successful form
+// installs; anything else keeps the serializer's existing behavior. The walk
+// mirrors the clone graph the way containsSharedMemory judges it: enumerable
+// own properties of plain/class objects and arrays, Map keys and values, Set
+// members, and each Error's non-enumerable cause; own properties of the
+// clone-special leaves (Date/RegExp/byte views/boxed primitives/host leaves)
+// are never serialized and need no mask. The whole mask/restore bracketing
+// one clone is synchronous, so the live run input is never observed masked.
+function maskErrorStringSlots(root) {
+  const masks = [];
+  let rootIsObject;
+  try {
+    rootIsObject = root !== null && typeof root === 'object';
+  } catch {
+    return () => {};
+  }
+  if (!rootIsObject) return () => {};
+
+  const seen = new Set();
+  const stack = [root];
+  const pushObject = child => {
+    let isObject;
+    try {
+      isObject = child !== null && typeof child === 'object';
+    } catch {
+      return;
+    }
+    if (isObject && !seen.has(child)) {
+      seen.add(child);
+      stack.push(child);
+    }
+  };
+
+  const maskSlot = (error, slot, maskValue) => {
+    let descriptor;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(error, slot);
+    } catch {
+      return;
+    }
+    // The precise shape defineOwnField gives a form-written slot: an own
+    // enumerable, writable, configurable data property. Anything else cannot
+    // be a form default and keeps the serializer's ordinary behavior.
+    if (!descriptor || !('value' in descriptor)) return;
+    if (!descriptor.enumerable || !descriptor.writable || !descriptor.configurable) return;
+    const value = descriptor.value;
+    if (value === null || typeof value !== 'object') return;
+    masks.push([error, slot, descriptor]);
+    Object.defineProperty(error, slot, {
+      value: maskValue, writable: true, enumerable: true, configurable: true,
+    });
+  };
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+
+    let hostLeaf = false;
+    for (const constructor of HOST_LEAF_CONSTRUCTORS) {
+      if (isInstanceOfGuarded(current, constructor)) { hostLeaf = true; break; }
+    }
+    if (hostLeaf) continue;
+    if (nodeTypes.isArrayBuffer(current) || nodeTypes.isTypedArray(current)
+      || nodeTypes.isDataView(current) || nodeTypes.isDate(current)
+      || nodeTypes.isRegExp(current) || nodeTypes.isBoxedPrimitive(current)) {
+      // The clone serializes only the internal bytes/time/pattern/wrapped
+      // value; own properties here are dropped without being read.
+      continue;
+    }
+
+    if (isArrayGuarded(current)) {
+      let keys;
+      try {
+        keys = Object.keys(current);
+      } catch {
+        keys = [];
+      }
+      for (const key of keys) {
+        try { pushObject(current[key]); } catch { /* unreadable member */ }
+      }
+      continue;
+    }
+    if (nodeTypes.isMap(current)) {
+      try {
+        for (const [key, child] of current) {
+          pushObject(key);
+          pushObject(child);
+        }
+      } catch { /* unreadable iterator */ }
+      continue;
+    }
+    if (nodeTypes.isSet(current)) {
+      try {
+        for (const member of current) pushObject(member);
+      } catch { /* unreadable iterator */ }
+      continue;
+    }
+    if (nodeTypes.isNativeError(current)) {
+      maskSlot(current, 'message', '');
+      maskSlot(current, 'name', undefined);
+      let present;
+      try {
+        present = Object.hasOwn(current, 'cause');
+      } catch {
+        present = false;
+      }
+      if (present) {
+        try { pushObject(current.cause); } catch { /* unreadable cause */ }
+      }
+    }
+
+    let keys;
+    try {
+      keys = Object.keys(current);
+    } catch {
+      continue;
+    }
+    for (const key of keys) {
+      try { pushObject(current[key]); } catch { /* unreadable member */ }
+    }
+  }
+
+  return () => {
+    for (const [error, slot, descriptor] of masks) {
+      Object.defineProperty(error, slot, descriptor);
+    }
+  };
+}
+
 function copyInputWithFormDefaults(input) {
-  const clone = structuredClone(input);
+  // Temporarily mask every own non-string data "message"/"name" slot on every
+  // Error reachable in the live graph so the serializer never ABSTRACT-string
+  // coerces a form-written slot — coercion that crashes when the message
+  // object carries an own non-callable "toString" field. The slots are
+  // restored on the live graph the instant the clone finishes (or throws);
+  // the clone keeps the "" message mask (repaired below) or omits the masked
+  // name (reattached by the dropped-key walk below). See restoreErrorMessage
+  // for the full argument.
+  const restoreSlots = maskErrorStringSlots(input);
+  let clone;
+  try {
+    clone = structuredClone(input);
+  } finally {
+    restoreSlots();
+  }
   const processed = new Set();
   // Pairs of [live node, its clone counterpart]. The lockstep walk follows
   // enumerable own properties — the same protocol forms and lookupOwn

@@ -300,8 +300,230 @@ test('async: compensation keeps the complete success-moment message and its own 
   assert.equal(Object.hasOwn(caller.failure, 'message'), false);
 });
 
-test('sync: the structured failure.message is present on the run input after a form', () => {
+// "toString" is an ordinary data field on the message object, no different
+// from "label": a string default written at failure.message.toString leaves
+// the message with an own non-callable toString. The Error serializer coerces
+// the message slot to a string while structured-cloning the input copy, and
+// that coercion threw ("Cannot convert object to primitive value"), killing
+// the whole async run before the business operation — or compensation — was
+// ever entered. These cases pin that the form-written object reaches every
+// independent copy whole, alongside the toString field.
+const TOSTRING_MESSAGE_FIELDS = [
+  { path: 'failure.message.label', type: 'string', default: 'web' },
+  { path: 'failure.message.toString', type: 'string', default: 'svc' },
+  { path: 'failure.message.meta.source', type: 'string', default: 'form' },
+  { path: 'failure.message.a.b.c', type: 'string', default: 'deep' },
+];
+
+function assertMessageWithToStringField(message) {
+  assert.equal(typeof message, 'object', 'the message stays an object, not a string');
+  assert.notEqual(message, null);
+  assert.equal(message.label, 'web');
+  assert.equal(message.toString, 'svc', 'toString is kept as the ordinary data field it is');
+  assert.deepEqual(message.meta, { source: 'form' });
+  assert.deepEqual(message.a, { b: { c: 'deep' } });
+}
+
+test('async: a business action reads an object message carrying an own toString data field', async () => {
   const workflow = workflowWith(
+    { id: 'act', type: 'action', operation: 'op', compensation: { operation: 'undo' }, next: 'done' },
+    TOSTRING_MESSAGE_FIELDS);
+  const caller = callerInput();
+
+  const result = await executeWorkflowAsync(workflow, caller, {
+    op: (input, output, nodeId, attempt) => {
+      assert.ok(input.failure instanceof Error);
+      assert.equal(input.failure.name, 'Error');
+      assert.deepEqual(input.failure.cause, { code: 'upstream' });
+      assertMessageWithToStringField(input.failure.message);
+      assert.equal(input.note, 'kept');
+      assert.equal(nodeId, 'act');
+      assert.equal(attempt, 1);
+      // The alias still resolves to the single copied Error and message.
+      assert.equal(input.holder.error, input.failure);
+      assert.equal(input.holder.error.message, input.failure.message);
+      assert.notEqual(input.failure, caller.failure);
+      return { ok: true };
+    },
+    undo: () => 'undone',
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(result.result, 'finished');
+  assert.deepEqual(result.trace.map(n => n.nodeId),
+    ['start', 'form-one', 'gate', 'act', 'done']);
+  assertMessageWithToStringField(result.context.input.failure.message);
+  assert.equal(result.context.input.holder.error, result.context.input.failure);
+  // No failed attempt was recorded preparing this legal input.
+  assert.deepEqual(result.actionAttempts.map(r => r.ok), [true]);
+  // The caller's raw Error is untouched.
+  assert.equal(Object.hasOwn(caller.failure, 'message'), false);
+  assert.equal(caller.holder.error, caller.failure);
+});
+
+test('async: editing the toString field or the message on an attempt copy stays within that copy', async () => {
+  const workflow = workflowWith(
+    { id: 'act', type: 'action', operation: 'op', next: 'done' },
+    TOSTRING_MESSAGE_FIELDS);
+  const caller = callerInput();
+
+  const result = await executeWorkflowAsync(workflow, caller, {
+    op: (input) => {
+      input.failure.message.label = 'hacked';
+      input.failure.message.toString = 'hacked-svc';
+      delete input.failure.message.a;
+      input.failure.message.brandNew = { only: 'this-copy' };
+      input.failure.message = 'replaced';
+      return 'A';
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assertMessageWithToStringField(result.context.input.failure.message);
+  assert.equal(Object.hasOwn(result.context.input.failure.message, 'brandNew'), false);
+  assert.equal(Object.hasOwn(caller.failure, 'message'), false);
+});
+
+test('async: a retried action always gets the pristine message including its toString field', async () => {
+  const workflow = workflowWith(
+    {
+      id: 'act', type: 'action', operation: 'op',
+      retry: { attempts: 2, initialDelayMs: 0, backoffFactor: 1, maxDelayMs: 0 },
+      next: 'done',
+    },
+    TOSTRING_MESSAGE_FIELDS);
+
+  const result = await executeWorkflowAsync(workflow, callerInput(), {
+    op: (input, output, nodeId, attempt) => {
+      assertMessageWithToStringField(input.failure.message);
+      if (attempt === 1) {
+        input.failure.message.label = 'hacked';
+        input.failure.message.toString = 'hacked-svc';
+        input.failure.message.attemptOnly = true;
+        throw new Error('first attempt fails');
+      }
+      return { ok: true };
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assertMessageWithToStringField(result.context.input.failure.message);
+  assert.equal(Object.hasOwn(result.context.input.failure.message, 'attemptOnly'), false);
+});
+
+test('async: compensation keeps the success-moment message with toString and an independent copy', async () => {
+  const workflow = {
+    id: 'tostring-comp-snapshot',
+    entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'form-one' },
+      { id: 'form-one', type: 'form', next: 'act', schema: { fields: TOSTRING_MESSAGE_FIELDS } },
+      {
+        id: 'act', type: 'action', operation: 'op',
+        compensation: { operation: 'undo' }, next: 'form-two',
+      },
+      // A later form adds to the message strictly AFTER act succeeded; it must
+      // never enter the compensation snapshot.
+      { id: 'form-two', type: 'form', next: 'boom', schema: { fields: [
+        { path: 'failure.message.after', type: 'string', default: 'late' },
+      ] } },
+      { id: 'boom', type: 'action', operation: 'boom', next: 'done' },
+      { id: 'done', type: 'end', result: 'ok' },
+    ],
+  };
+  const caller = callerInput();
+  const seen = [];
+
+  const result = await executeWorkflowAsync(workflow, caller, {
+    op: () => ({ id: 'tx-1' }),
+    undo: (input) => {
+      assert.ok(input.failure instanceof Error);
+      assertMessageWithToStringField(input.failure.message);
+      assert.equal(Object.hasOwn(input.failure.message, 'after'), false,
+        'a default added after the success moment is not in the snapshot');
+      seen.push(JSON.parse(JSON.stringify(input.failure.message)));
+      input.failure.message.label = 'comp-hacked';
+      input.failure.message.toString = 'comp-svc';
+      input.failure.message.compOnly = true;
+      return 'released';
+    },
+    boom: () => { throw new Error('boom'); },
+  });
+
+  assert.equal(result.status, 'action_failed');
+  assert.equal(result.nodeId, 'boom');
+  assert.equal(result.compensationStatus, 'completed');
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0], {
+    label: 'web', toString: 'svc', meta: { source: 'form' }, a: { b: { c: 'deep' } },
+  });
+
+  // The run input keeps both forms' writes and none of compensation's edits.
+  assertMessageWithToStringField(result.context.input.failure.message);
+  assert.equal(result.context.input.failure.message.after, 'late');
+  assert.equal(Object.hasOwn(result.context.input.failure.message, 'compOnly'), false);
+  assert.equal(Object.hasOwn(caller.failure, 'message'), false);
+});
+
+test('async: form-written object name slots (with a toString field) survive through causes and container aliases', async () => {
+  const cause = new Error();
+  const failure = new Error(undefined, { cause });
+  const caller = {
+    failure,
+    holder: { error: failure },
+    causeHolder: { c: cause },
+    byMap: new Map([['e', failure]]),
+    bySet: new Set([cause]),
+  };
+  const workflow = {
+    id: 'tostring-name-slots',
+    entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'form-one' },
+      { id: 'form-one', type: 'form', next: 'act', schema: { fields: [
+        ...TOSTRING_MESSAGE_FIELDS,
+        { path: 'failure.name.kind', type: 'string', default: 'Outer' },
+        { path: 'failure.name.toString', type: 'string', default: 'outerName' },
+        { path: 'failure.cause.name.kind', type: 'string', default: 'Inner' },
+        { path: 'failure.cause.name.toString', type: 'string', default: 'innerName' },
+        { path: 'failure.cause.message.label', type: 'string', default: 'cause-msg' },
+        { path: 'failure.cause.message.toString', type: 'string', default: 'causeSvc' },
+      ] } },
+      { id: 'act', type: 'action', operation: 'op', next: 'done' },
+      { id: 'done', type: 'end', result: 'ok' },
+    ],
+  };
+
+  const result = await executeWorkflowAsync(workflow, caller, {
+    op: (input) => {
+      assert.ok(input.failure instanceof Error);
+      assert.ok(input.failure.cause instanceof Error);
+      // Aliases across plain objects, a Map and a Set survive in this copy.
+      assert.equal(input.holder.error, input.failure);
+      assert.equal(input.byMap.get('e'), input.failure);
+      assert.equal(input.bySet.has(input.failure.cause), true);
+      assert.equal(input.causeHolder.c, input.failure.cause);
+      assertMessageWithToStringField(input.failure.message);
+      assert.deepEqual(input.failure.name, { kind: 'Outer', toString: 'outerName' });
+      assert.deepEqual(input.failure.cause.name, { kind: 'Inner', toString: 'innerName' });
+      assert.deepEqual(input.failure.cause.message, { label: 'cause-msg', toString: 'causeSvc' });
+      // Edits stay on this attempt's copy.
+      input.failure.name.kind = 'Z';
+      input.failure.cause.message.label = 'Z';
+      return 'A';
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(result.context.input.failure.name, { kind: 'Outer', toString: 'outerName' });
+  assert.deepEqual(result.context.input.failure.cause.name, { kind: 'Inner', toString: 'innerName' });
+  assert.deepEqual(result.context.input.failure.cause.message, { label: 'cause-msg', toString: 'causeSvc' });
+  assertMessageWithToStringField(result.context.input.failure.message);
+  assert.equal(Object.hasOwn(caller.failure, 'name'), false);
+  assert.equal(Object.hasOwn(caller.failure.cause, 'name'), false);
+});
+
+test('sync: the structured failure.message is present on the run input after a form', () => {  const workflow = workflowWith(
     { id: 'act', type: 'action', message: 'go', next: 'done' },
     OBJECT_MESSAGE_FIELDS);
   const caller = callerInput();
@@ -391,4 +613,34 @@ test('reception: a caller-attached object/number own message is not resurrected 
   assert.equal(numberRun.status, 'completed');
   assert.equal(numberSaw, '42');
   assert.equal(typeof numberSaw, 'string');
+});
+
+test('reception: a caller-attached uncoercible object message keeps the raw receiving-clone failure', async () => {
+  // The repair covers only slots a FORM writes during the run. An own object
+  // message the CALLER attached before the run — here one that cannot even be
+  // coerced to a string because its own toString is not callable — still goes
+  // through the ordinary receiving structured clone and fails it exactly as
+  // before: a rejected run, never an operation invocation or attempt record.
+  const workflow = {
+    id: 'caller-uncoercible-message',
+    entry: 'start',
+    nodes: [
+      { id: 'start', type: 'trigger', next: 'form-one' },
+      { id: 'form-one', type: 'form', next: 'act', schema: { fields: [] } },
+      { id: 'act', type: 'action', operation: 'op', next: 'done' },
+      { id: 'done', type: 'end', result: 'ok' },
+    ],
+  };
+  const failure = new Error();
+  Object.defineProperty(failure, 'message', {
+    value: { toString: 'svc' }, writable: true, enumerable: true, configurable: true,
+  });
+  let opRan = false;
+  await assert.rejects(
+    executeWorkflowAsync(workflow, { failure }, { op: () => { opRan = true; return 'A'; } }),
+    error => error instanceof TypeError && /Cannot convert object to primitive value/.test(error.message),
+  );
+  assert.equal(opRan, false);
+  // The caller's value is left as given.
+  assert.deepEqual(failure.message, { toString: 'svc' });
 });
