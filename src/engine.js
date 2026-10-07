@@ -317,14 +317,19 @@ function compileCondition(condition, nodes, nodeId, position = '$', depth = 1) {
 
 // The normalized outgoing edges (next / then+else / none for end) of the node
 // objects of the most recent compile pass that ran to completion — the one
-// place branch destinations are read at edge-traversal time. Unlike the form
-// rules, condition trees, action bindings and dependency lists (each captured
-// per run in a fresh map), successors are read here lazily when a node
-// actually completes, which is the existing behavior a successful validation
-// keeps: after a fully successful validateWorkflow (or the validation pass an
-// execution entry makes at its own start), a run parked on a pending business
-// operation that has not left a node yet uses the newly accepted successors,
-// and a new run started from the edited definition uses them too.
+// place branch destinations are read at edge-traversal time. A condition
+// node's two exits are stored and read as ONE pair ([then, else]), so the
+// target chosen for either result is always an exit the same successful
+// validation accepted together with its sibling; the rule protects then and
+// else alike, never just then. Unlike the form rules, condition trees, action
+// bindings and dependency lists (each captured per run in a fresh map),
+// successors are read here lazily when a node actually completes (or, for a
+// condition, the moment its pinned expression is evaluated), which is the
+// existing behavior a successful validation keeps: after a fully successful
+// validateWorkflow (or the validation pass an execution entry makes at its
+// own start), a run parked on a pending business operation that has not left
+// a node yet uses the newly accepted successors, and a new run started from
+// the edited definition uses them too.
 //
 // Publication is all-or-nothing per pass: compileWorkflow normalizes
 // successors into a pass-local map and only publishes it here AFTER every
@@ -2144,7 +2149,21 @@ function applyRegularNode(node, state) {
     if (!outcome.ok) {
       return { status: 'invalid_condition', context: state.context, trace: state.trace, error: outcome.error };
     }
-    state.activated.add(outcome.value ? node.then : node.else);
+    // The branch TARGET is selected from the successor relations the most
+    // recent whole-definition validation accepted — the same shared
+    // successorTargets store every other successor edge is read from — and
+    // never directly from the live node.then / node.else. normalizeSuccessors
+    // stores the pair as [then, else] and a pass publishes it only after
+    // every node and whole-definition check passes, so the two exits are
+    // always the pair accepted together by one successful validation: an
+    // edit whose validation was refused (an error on another node or a cycle
+    // found only at the end), or an edit never validated at all, leaves a
+    // parked run on the last accepted edge for BOTH then and else — not just
+    // then — while a fully successful revalidation still updates an exit this
+    // run has not chosen yet. Only the selected exit is activated; the
+    // unchosen target never runs, exactly as before.
+    const branchTargets = successorTargets.get(node);
+    state.activated.add(outcome.value ? branchTargets[0] : branchTargets[1]);
   } else {
     for (const target of successorTargets.get(node)) state.activated.add(target);
   }
