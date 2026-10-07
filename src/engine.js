@@ -315,6 +315,14 @@ function compileCondition(condition, nodes, nodeId, position = '$', depth = 1) {
   return { kind: 'comparison', operator: condition.operator, left, right };
 }
 
+// The successor edges every run resolves against, keyed by node object. A
+// validation pass publishes into this map ONLY after the whole definition has
+// been accepted (see compileWorkflow): a rejected validateWorkflow — whether
+// it fails on a later node's edge, on a cycle found after every connection
+// checked out, or on any other node, reachable or not — leaves the edges the
+// most recent SUCCESSFUL validation accepted untouched, so a run already in
+// flight keeps following exactly those. A successful revalidation replaces
+// them, and runs started (or still parked) afterwards see the new edges.
 const successorTargets = new WeakMap();
 
 const RETRY_FIELDS = ['attempts', 'initialDelayMs', 'backoffFactor', 'maxDelayMs'];
@@ -630,11 +638,11 @@ function normalizeDependencies(node, nodes, entryId) {
 // whose first and last entries match and whose steps are real edges or
 // dependency relations.
 //
-// `dependencies` is the per-pass map compileWorkflow built, keyed by the
-// node objects of this definition; it is never read from module-level,
-// node-keyed storage, so a later validateWorkflow over the same objects can
-// never change which relations this check (or a run that started through it)
-// uses.
+// `successors` and `dependencies` are the per-pass maps compileWorkflow
+// built, keyed by the node objects of this definition; neither is read from
+// module-level, node-keyed storage, so a later validateWorkflow over the same
+// objects can never change which relations this check (or a run that started
+// through it) uses.
 //
 // The search is an iterative three-color DFS with an explicit frame stack:
 // a recursive walk over a legal definition tens of thousands of chained
@@ -642,10 +650,10 @@ function normalizeDependencies(node, nodes, entryId) {
 // holds the gray nodes in DFS order (what a recursive stack would hold) and
 // `depthById` locates a gray node in it, so a back edge still reports
 // exactly the cycle segment — never the entry path leading into it.
-function detectCycles(nodes, dependencies) {
+function detectCycles(nodes, successors, dependencies) {
   const adjacency = new Map([...nodes.keys()].map(id => [id, []]));
   for (const [id, node] of nodes) {
-    adjacency.get(id).push(...successorTargets.get(node));
+    adjacency.get(id).push(...successors.get(node));
     for (const dependency of dependencies.get(node)) {
       adjacency.get(dependency).push(id);
     }
@@ -730,14 +738,30 @@ function compileWorkflow(workflow) {
   // later one, so editing the original dependsOn array in place, replacing
   // it with another array, deleting the property or adding one afterwards
   // reaches only runs started later.
+  //
+  // The successor map is the resolved next/then/else edges of every node this
+  // pass accepted. It stays local to the pass while validation is in
+  // progress: the edges a run follows live in the shared successorTargets
+  // map, and this pass publishes into that map only after the WHOLE
+  // definition has been accepted (the commit just below the cycle check). A
+  // validateWorkflow that is rejected — by a later node's bad edge, by a
+  // cycle discovered only after every connection checked out, or by a node on
+  // an untaken branch or one the entry cannot reach — therefore cannot
+  // replace the edges the most recent successful validation installed: an
+  // in-flight run parked on a business operation keeps the successors its
+  // start-time validation accepted, never a rejected edit's. This covers
+  // every way next can change — a replaced single target, a replaced array,
+  // and elements added to or removed from the original array in place — since
+  // only the committed arrays are ever read at execution.
   const formRules = new Map();
   const conditionRules = new Map();
   const actionBindings = new Map();
   const dependencies = new Map();
+  const successors = new Map();
 
   let requiresSingleEnd = false;
   for (const node of nodes.values()) {
-    successorTargets.set(node, normalizeSuccessors(node, nodes));
+    successors.set(node, normalizeSuccessors(node, nodes));
     const nodeDependencies = normalizeDependencies(node, nodes, workflow.entry);
     dependencies.set(node, nodeDependencies);
     const usesArraySuccessors = node.type !== 'end' && node.type !== 'condition' && Array.isArray(node.next);
@@ -766,7 +790,15 @@ function compileWorkflow(workflow) {
     }
   }
 
-  detectCycles(nodes, dependencies);
+  detectCycles(nodes, successors, dependencies);
+
+  // The definition is fully accepted: publish this pass's successor edges so
+  // runs resolving successors from here on — including runs already parked on
+  // a business operation — see them. Until this point a rejected pass has
+  // touched nothing a run can observe.
+  for (const [node, targets] of successors) {
+    successorTargets.set(node, targets);
+  }
   return { nodes, formRules, conditionRules, actionBindings, dependencies };
 }
 
@@ -1926,7 +1958,10 @@ async function compensateRun(state, operations) {
 // branch destinations (then/else/next) are deliberately not snapshotted
 // here: only the condition *expression*, the action configuration and the
 // dependency relations are pinned to the run's start, matching the
-// form-rules rule.
+// form-rules rule. What a run resolves through successorTargets is still
+// always the product of a fully successful validation — a rejected
+// validateWorkflow never publishes its edges there (see compileWorkflow) —
+// so a failed edit cannot reroute a run already in flight.
 function createRunState(nodes, workflow, input, formRules, conditionRules, actionBindings, dependencies) {
   const declarationOrder = [...nodes.values()];
   const declarationIndex = new Map(declarationOrder.map((node, index) => [node.id, index]));
