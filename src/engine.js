@@ -580,12 +580,71 @@ function captureEndResult(node) {
   return readConfiguredCopy(node, 'result', END_RESULT_COPY_ERRORS, null);
 }
 
+// The one entry-level rule shared by every node-id relation list:
+//
+// A trigger's, form's or action node's `next` array and any node's
+// `dependsOn` array are both lists of node ids, and the per-entry checks are
+// the same for both relations:
+//   1. every entry is a string;
+//   2. no identifier repeats within the list;
+//   3. every identifier names a node that exists in this definition.
+// Those three checks used to be coded separately inside normalizeSuccessors
+// and normalizeDependencies (each with its own wording), so maintaining the
+// shared rule meant editing both places. They now live in
+// normalizeRelationEntries alone; the two relations only supply their own
+// error wording (`errors`) and their business-specific restrictions via
+// `checkEntry` / the surrounding normalize* function.
+//
+// The list is walked once, in the caller's declaration order, and the first
+// failing entry — non-string, then duplicate, then unknown target — is the
+// error reported, exactly the precedence and wording each relation had
+// before it shared this code. `checkEntry`, when given, applies the
+// relation's own extra per-entry rule at the same position (right after the
+// existence check), so a problem on an earlier entry is never masked by a
+// problem on a later one. The accepted identifiers are returned in a fresh
+// array in declaration order; the caller's array and node objects are never
+// rewritten.
+function normalizeRelationEntries(entries, node, nodes, errors, checkEntry = null) {
+  const accepted = [];
+  const seen = new Set();
+  for (const entry of entries) {
+    if (typeof entry !== 'string') {
+      throw new Error(errors.notString(node.id));
+    }
+    if (seen.has(entry)) {
+      throw new Error(errors.duplicate(node.id, entry));
+    }
+    seen.add(entry);
+    if (!nodes.has(entry)) {
+      throw new Error(errors.unknown(node.id));
+    }
+    if (checkEntry !== null) checkEntry(entry);
+    accepted.push(entry);
+  }
+  return accepted;
+}
+
+const SUCCESSOR_ENTRY_ERRORS = {
+  notString: nodeId => `node ${nodeId}: next array entries must be node id strings`,
+  duplicate: (nodeId, destination) => `node ${nodeId}: duplicate destination ${destination}`,
+  unknown: nodeId => `node ${nodeId} points to an unknown destination`,
+};
+
+const DEPENDENCY_ENTRY_ERRORS = {
+  notString: nodeId => `node ${nodeId}: dependsOn entries must be node id strings`,
+  duplicate: (nodeId, dependency) => `node ${nodeId}: duplicate dependency ${dependency}`,
+  unknown: nodeId => `node ${nodeId} depends on an unknown node`,
+};
+
 // Resolves the outgoing edges of a node. Trigger, form and action nodes may
 // name a single successor or a non-empty, duplicate-free array of successors;
 // conditions keep their then/else pair and end nodes have none.
 function normalizeSuccessors(node, nodes) {
   if (node.type === 'end') return [];
   if (node.type === 'condition') {
+    // Condition exits are single destinations, not relation lists, so they
+    // keep their own pair check while sharing the unknown-destination
+    // wording with ordinary next edges.
     for (const destination of [node.then, node.else]) {
       if (typeof destination !== 'string' || !nodes.has(destination)) {
         throw new Error(`node ${node.id} points to an unknown destination`);
@@ -595,24 +654,16 @@ function normalizeSuccessors(node, nodes) {
   }
   const next = node.next;
   if (Array.isArray(next)) {
+    // Successor-specific rule the shared entry check does not own: a
+    // successor array must activate at least one node. With no entries to
+    // examine it is reported before the shared checks, as before.
     if (next.length === 0) {
       throw new Error(`node ${node.id}: next array must not be empty`);
     }
-    const seen = new Set();
-    for (const destination of next) {
-      if (typeof destination !== 'string') {
-        throw new Error(`node ${node.id}: next array entries must be node id strings`);
-      }
-      if (seen.has(destination)) {
-        throw new Error(`node ${node.id}: duplicate destination ${destination}`);
-      }
-      seen.add(destination);
-      if (!nodes.has(destination)) {
-        throw new Error(`node ${node.id} points to an unknown destination`);
-      }
-    }
-    return [...seen];
+    return normalizeRelationEntries(next, node, nodes, SUCCESSOR_ENTRY_ERRORS);
   }
+  // A single successor id is not a relation list either; keep its own
+  // one-destination check (and the same unknown-destination wording).
   if (typeof next !== 'string' || !nodes.has(next)) {
     throw new Error(`node ${node.id} points to an unknown destination`);
   }
@@ -624,26 +675,25 @@ function normalizeSuccessors(node, nodes) {
 // dependencies, and the entry node must not declare any.
 function normalizeDependencies(node, nodes, entryId) {
   if (!Object.hasOwn(node, 'dependsOn') || node.dependsOn === undefined) return [];
+  // Dependency-specific container rule: dependsOn may be omitted, undefined
+  // or an array, but never a non-array value.
   if (!Array.isArray(node.dependsOn)) {
     throw new Error(`node ${node.id}: dependsOn must be an array`);
   }
-  const seen = new Set();
-  for (const dependency of node.dependsOn) {
-    if (typeof dependency !== 'string') {
-      throw new Error(`node ${node.id}: dependsOn entries must be node id strings`);
-    }
-    if (seen.has(dependency)) {
-      throw new Error(`node ${node.id}: duplicate dependency ${dependency}`);
-    }
-    seen.add(dependency);
-    if (!nodes.has(dependency)) {
-      throw new Error(`node ${node.id} depends on an unknown node`);
-    }
-    if (dependency === node.id) {
-      throw new Error(`node ${node.id} must not depend on itself`);
-    }
-  }
-  const dependencies = [...seen];
+  // The shared entry rule (strings, no duplicates, existing targets) plus
+  // the dependency-specific self rule, examined per entry immediately after
+  // existence: a self-dependency on an earlier entry still wins over any
+  // problem a later entry carries.
+  const dependencies = normalizeRelationEntries(
+    node.dependsOn, node, nodes, DEPENDENCY_ENTRY_ERRORS,
+    dependency => {
+      if (dependency === node.id) {
+        throw new Error(`node ${node.id} must not depend on itself`);
+      }
+    },
+  );
+  // Dependency-specific whole-list rule, applied only after every entry was
+  // accepted: the entry node itself must not wait on anything.
   if (node.id === entryId && dependencies.length > 0) {
     throw new Error(`entry node ${node.id} must not declare dependencies`);
   }
