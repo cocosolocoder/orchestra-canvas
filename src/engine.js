@@ -580,6 +580,50 @@ function captureEndResult(node) {
   return readConfiguredCopy(node, 'result', END_RESULT_COPY_ERRORS, null);
 }
 
+// The per-entry rules every node-relation list shares — a successor array and
+// a dependsOn list alike: each entry must be a node id string, must not
+// repeat an earlier entry, and must name a node in this definition. Entries
+// are checked in declaration order and the first problem found is reported,
+// so a list carrying several issues fails on the same entry, with the same
+// message, whichever relation it belongs to. The caller's array is never
+// modified; the relation is returned as a fresh duplicate-free id list in
+// declaration order.
+//
+// The wording of each failure is relation-specific (`wording`), and a
+// relation may attach its own per-entry rule through `checkEntry`, invoked
+// after the common checks for that entry (dependencies use it for the
+// no-self-dependency rule, so it fires at exactly the position the former
+// inline loop checked it).
+const SUCCESSOR_WORDING = {
+  notString: nodeId => `node ${nodeId}: next array entries must be node id strings`,
+  duplicate: (nodeId, entry) => `node ${nodeId}: duplicate destination ${entry}`,
+  unknown: nodeId => `node ${nodeId} points to an unknown destination`,
+};
+
+const DEPENDENCY_WORDING = {
+  notString: nodeId => `node ${nodeId}: dependsOn entries must be node id strings`,
+  duplicate: (nodeId, entry) => `node ${nodeId}: duplicate dependency ${entry}`,
+  unknown: nodeId => `node ${nodeId} depends on an unknown node`,
+};
+
+function checkNodeReferences(node, nodes, entries, wording, checkEntry) {
+  const seen = new Set();
+  for (const entry of entries) {
+    if (typeof entry !== 'string') {
+      throw new Error(wording.notString(node.id));
+    }
+    if (seen.has(entry)) {
+      throw new Error(wording.duplicate(node.id, entry));
+    }
+    seen.add(entry);
+    if (!nodes.has(entry)) {
+      throw new Error(wording.unknown(node.id));
+    }
+    if (checkEntry) checkEntry(entry);
+  }
+  return [...seen];
+}
+
 // Resolves the outgoing edges of a node. Trigger, form and action nodes may
 // name a single successor or a non-empty, duplicate-free array of successors;
 // conditions keep their then/else pair and end nodes have none.
@@ -598,20 +642,7 @@ function normalizeSuccessors(node, nodes) {
     if (next.length === 0) {
       throw new Error(`node ${node.id}: next array must not be empty`);
     }
-    const seen = new Set();
-    for (const destination of next) {
-      if (typeof destination !== 'string') {
-        throw new Error(`node ${node.id}: next array entries must be node id strings`);
-      }
-      if (seen.has(destination)) {
-        throw new Error(`node ${node.id}: duplicate destination ${destination}`);
-      }
-      seen.add(destination);
-      if (!nodes.has(destination)) {
-        throw new Error(`node ${node.id} points to an unknown destination`);
-      }
-    }
-    return [...seen];
+    return checkNodeReferences(node, nodes, next, SUCCESSOR_WORDING);
   }
   if (typeof next !== 'string' || !nodes.has(next)) {
     throw new Error(`node ${node.id} points to an unknown destination`);
@@ -627,23 +658,12 @@ function normalizeDependencies(node, nodes, entryId) {
   if (!Array.isArray(node.dependsOn)) {
     throw new Error(`node ${node.id}: dependsOn must be an array`);
   }
-  const seen = new Set();
-  for (const dependency of node.dependsOn) {
-    if (typeof dependency !== 'string') {
-      throw new Error(`node ${node.id}: dependsOn entries must be node id strings`);
-    }
-    if (seen.has(dependency)) {
-      throw new Error(`node ${node.id}: duplicate dependency ${dependency}`);
-    }
-    seen.add(dependency);
-    if (!nodes.has(dependency)) {
-      throw new Error(`node ${node.id} depends on an unknown node`);
-    }
-    if (dependency === node.id) {
-      throw new Error(`node ${node.id} must not depend on itself`);
-    }
-  }
-  const dependencies = [...seen];
+  const dependencies = checkNodeReferences(node, nodes, node.dependsOn, DEPENDENCY_WORDING,
+    dependency => {
+      if (dependency === node.id) {
+        throw new Error(`node ${node.id} must not depend on itself`);
+      }
+    });
   if (node.id === entryId && dependencies.length > 0) {
     throw new Error(`entry node ${node.id} must not declare dependencies`);
   }
