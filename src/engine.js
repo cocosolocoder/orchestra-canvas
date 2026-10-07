@@ -1424,6 +1424,15 @@ function cloneRunInput(input) {
 // containsSharedMemory, the walk pairs source and clone causes explicitly —
 // a cause chain (Error -> cause -> Error -> cause -> Date) is followed link
 // by link exactly like any other path.
+//
+// A second gap sits one level up: the clone keeps an own "message" for an
+// Error, but coerced to a string — a message this run's forms created as an
+// object (the parent of failure.message.label) or as a number/boolean
+// default arrives as text, and the key walk skips it precisely because the
+// clone has an own property of that name. The walk therefore also restores
+// any non-string source message from an independent clone of the source
+// value; string messages survive the clone untouched and keep their
+// existing handling.
 function copyInputWithFormDefaults(input) {
   const clone = structuredClone(input);
   const processed = new Set();
@@ -1485,6 +1494,50 @@ function copyInputWithFormDefaults(input) {
       }
       if (isTraversable(sourceValue) && isTraversable(targetValue)) {
         stack.push([sourceValue, targetValue]);
+      }
+    }
+
+    // A native Error's own "message" survives the clone only as a string:
+    // structuredClone coerces whatever it finds with String(), so a message
+    // a successful form created during this run — the parent object built
+    // for failure.message.label, or a number/boolean default installed for a
+    // missing failure.message — comes out of the clone as text ("[object
+    // Object]", "42", "true"), and the key walk above cannot repair it
+    // because the clone DOES carry an own "message" (the coerced one). The
+    // validated field content would be silently lost in every copy. Whenever
+    // the source message is not a string it cannot have survived the clone,
+    // so replace the coerced value with an independent copy of the source
+    // message — a form-created message subtree holds only primitives and
+    // fresh plain objects, so this clone always succeeds and detaches the
+    // copy from the live run input. A string message already reached the
+    // clone verbatim and is left exactly as structuredClone produced it.
+    if (nodeTypes.isNativeError(source)) {
+      let sourceHasMessage;
+      try {
+        sourceHasMessage = Object.hasOwn(source, 'message');
+      } catch {
+        sourceHasMessage = false;
+      }
+      if (sourceHasMessage) {
+        let sourceMessage;
+        try {
+          sourceMessage = source.message;
+        } catch {
+          sourceMessage = undefined;
+        }
+        if (sourceMessage !== undefined && typeof sourceMessage !== 'string') {
+          let messageEnumerable = true;
+          try {
+            const descriptor = Object.getOwnPropertyDescriptor(source, 'message');
+            if (descriptor) messageEnumerable = descriptor.enumerable;
+          } catch {
+            messageEnumerable = true;
+          }
+          Object.defineProperty(target, 'message', {
+            value: structuredClone(sourceMessage),
+            writable: true, enumerable: messageEnumerable, configurable: true,
+          });
+        }
       }
     }
 
