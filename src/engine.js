@@ -315,6 +315,27 @@ function compileCondition(condition, nodes, nodeId, position = '$', depth = 1) {
   return { kind: 'comparison', operator: condition.operator, left, right };
 }
 
+// The normalized outgoing edges (next / then+else / none for end) of the node
+// objects of the most recent compile pass that ran to completion — the one
+// place branch destinations are read at edge-traversal time. Unlike the form
+// rules, condition trees, action bindings and dependency lists (each captured
+// per run in a fresh map), successors are read here lazily when a node
+// actually completes, which is the existing behavior a successful validation
+// keeps: after a fully successful validateWorkflow (or the validation pass an
+// execution entry makes at its own start), a run parked on a pending business
+// operation that has not left a node yet uses the newly accepted successors,
+// and a new run started from the edited definition uses them too.
+//
+// Publication is all-or-nothing per pass: compileWorkflow normalizes
+// successors into a pass-local map and only publishes it here AFTER every
+// node and every whole-definition check (the single-end rule and cycle
+// detection included) has passed. A pass rejected on a node examined later,
+// or by the cycle check that runs last — even for an edge on an untaken
+// branch or an entry-unreachable node — never replaces any entry: the
+// relations of the most recent SUCCESSFUL validation survive, so a parked
+// run cannot be rerouted by an edit the caller never got accepted, and a
+// later restore of the definition needs no second validation. Keyed by node
+// object, independent passes over distinct definitions never interfere.
 const successorTargets = new WeakMap();
 
 const RETRY_FIELDS = ['attempts', 'initialDelayMs', 'backoffFactor', 'maxDelayMs'];
@@ -630,11 +651,14 @@ function normalizeDependencies(node, nodes, entryId) {
 // whose first and last entries match and whose steps are real edges or
 // dependency relations.
 //
-// `dependencies` is the per-pass map compileWorkflow built, keyed by the
-// node objects of this definition; it is never read from module-level,
-// node-keyed storage, so a later validateWorkflow over the same objects can
-// never change which relations this check (or a run that started through it)
-// uses.
+// `dependencies` and `successorRules` are the per-pass maps compileWorkflow
+// built, keyed by the node objects of this definition; they are never read
+// from module-level, node-keyed storage, so a later validateWorkflow over the
+// same objects can never change which relations this check (or a run that
+// started through it) uses. Successor rules in particular are still local to
+// the pass while this final check runs — they reach the shared
+// successorTargets map only if this check passes — so a cycle rejection
+// publishes no new successor relation.
 //
 // The search is an iterative three-color DFS with an explicit frame stack:
 // a recursive walk over a legal definition tens of thousands of chained
@@ -642,10 +666,10 @@ function normalizeDependencies(node, nodes, entryId) {
 // holds the gray nodes in DFS order (what a recursive stack would hold) and
 // `depthById` locates a gray node in it, so a back edge still reports
 // exactly the cycle segment — never the entry path leading into it.
-function detectCycles(nodes, dependencies) {
+function detectCycles(nodes, dependencies, successorRules) {
   const adjacency = new Map([...nodes.keys()].map(id => [id, []]));
   for (const [id, node] of nodes) {
-    adjacency.get(id).push(...successorTargets.get(node));
+    adjacency.get(id).push(...successorRules.get(node));
     for (const dependency of dependencies.get(node)) {
       adjacency.get(dependency).push(id);
     }
@@ -702,6 +726,19 @@ function detectCycles(nodes, dependencies) {
 // rules, tree, binding and dependency list captured then — including the
 // action's operation name, retry settings, and whether it compensates with
 // which compensation operation and retry settings.
+//
+// Successor relations (next / then / else) are normalized into a fifth,
+// pass-local map as well and are published to the shared successorTargets
+// store — which the execution loop reads lazily at edge-traversal time —
+// only after every per-node check, the single-end rule and the cycle check
+// have all passed. A rejected pass (a bad edge on a node examined later, a
+// cycle detected only at the end, or an error on an untaken or
+// entry-unreachable branch) therefore never publishes a single successor:
+// the most recent SUCCESSFUL validation remains the set a run follows, so a
+// parked run cannot be rerouted by an edit whose validation was refused, and
+// reverting the definition needs no revalidation. A fully successful pass
+// still publishes, preserving the existing behavior that a valid edit updates
+// the successors a run has not traversed yet and that new runs adopt.
 function compileWorkflow(workflow) {
   assertPlainObject(workflow, 'workflow');
   if (typeof workflow.id !== 'string' || !workflow.id.trim()) throw new Error('workflow.id is required');
@@ -734,10 +771,23 @@ function compileWorkflow(workflow) {
   const conditionRules = new Map();
   const actionBindings = new Map();
   const dependencies = new Map();
+  // Successors are normalized into THIS pass's own map, exactly like the
+  // other four snapshots, rather than written straight into the shared
+  // successorTargets WeakMap: a pass that fails on a later node, on the
+  // single-end rule, or in detectCycles must not leave behind the successor
+  // relations its earlier nodes already normalized. The map reaches the
+  // shared store — the one execution reads at edge-traversal time — only
+  // after the whole pass succeeds, atomically replacing the previous
+  // successful pass's relations. This keeps the existing behavior that a
+  // successful validation updates the successors a parked run uses, while a
+  // rejected validation leaves the last accepted next/then/else relations
+  // completely untouched (including an edit reverted by the caller without a
+  // second validation: the run still follows the last accepted edge).
+  const successorRules = new Map();
 
   let requiresSingleEnd = false;
   for (const node of nodes.values()) {
-    successorTargets.set(node, normalizeSuccessors(node, nodes));
+    successorRules.set(node, normalizeSuccessors(node, nodes));
     const nodeDependencies = normalizeDependencies(node, nodes, workflow.entry);
     dependencies.set(node, nodeDependencies);
     const usesArraySuccessors = node.type !== 'end' && node.type !== 'condition' && Array.isArray(node.next);
@@ -766,7 +816,18 @@ function compileWorkflow(workflow) {
     }
   }
 
-  detectCycles(nodes, dependencies);
+  detectCycles(nodes, dependencies, successorRules);
+
+  // Every node and whole-definition check passed, so this pass is accepted:
+  // publish its successor relations to the shared store execution reads,
+  // replacing the previous successful pass's entries for these node objects.
+  // This line is the ONLY publication site — anything thrown above (a later
+  // node's bad edge, the single-end rule, or this cycle check) leaves every
+  // existing entry exactly as the last successful validation had it, so a
+  // rejected edit can never reroute a run that had accepted an earlier pass.
+  for (const [node, targets] of successorRules) {
+    successorTargets.set(node, targets);
+  }
   return { nodes, formRules, conditionRules, actionBindings, dependencies };
 }
 
@@ -1923,10 +1984,18 @@ async function compensateRun(state, operations) {
 // and fresh retry/compensation objects compileAction built; the dependency
 // lists are fresh arrays of id strings normalizeDependencies built — so all
 // four snapshots are already independent of the caller's definition. The
-// branch destinations (then/else/next) are deliberately not snapshotted
-// here: only the condition *expression*, the action configuration and the
-// dependency relations are pinned to the run's start, matching the
-// form-rules rule.
+// branch destinations (then/else/next) are deliberately not snapshotted into
+// run state: when a node completes, its successors are read from the shared
+// successorTargets store — the relations of the most recent compile pass that
+// RAN TO COMPLETION. This is the existing "successful validation updates
+// successors" rule: a valid edit revalidated while this run is parked on a
+// business operation can still route the node once it completes, and new runs
+// start under it. What a rejected validation can never do is alter that
+// store, since its successors are published only after the entire pass
+// passes (later-node checks, the single-end rule and the cycle check
+// included); so an edit whose validateWorkflow threw — even one reverted
+// afterwards without revalidating — leaves this run following the last
+// accepted next/then/else edges.
 function createRunState(nodes, workflow, input, formRules, conditionRules, actionBindings, dependencies) {
   const declarationOrder = [...nodes.values()];
   const declarationIndex = new Map(declarationOrder.map((node, index) => [node.id, index]));
